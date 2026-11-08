@@ -1,7 +1,7 @@
 /**
- * lib/pipe.ts (6.0.0): a work space's AI tabs close when its engine leaves, or IDLE_CLOSE_MS after
- * the relay socket dropped and no engine came back; tabs of a work space with an engine, and the
- * person's tabs, stay.
+ * lib/pipe.ts (6.0.0): a work space's AI tabs close when the AI says it is done (`close`), or
+ * IDLE_CLOSE_MS after its engine went away and did not come back; tabs of a work space with an
+ * engine, the tab the person is looking at, and the person's own tabs stay.
  */
 import assert from "node:assert/strict";
 
@@ -31,18 +31,23 @@ globalThis.chrome = {
   },
 };
 
-const { closeAllPipes, closeIdleAiTabs, closePipe, installPipe, openPipe, IDLE_CLOSE_MS } = await import("../entrypoints/lib/pipe.ts");
+const { closeAllPipes, closeIdleAiTabs, closePipe, closeWorkspaceTabs, installPipe, openPipe, IDLE_CLOSE_MS } = await import("../entrypoints/lib/pipe.ts");
 const { createControlledTab } = await import("../entrypoints/lib/target.ts");
 installPipe(frame => sent.push(frame), () => {}, () => null);
 
-// An engine that leaves takes its work space's tabs with it.
+// An engine that ends on its own keeps its tab for when it comes back; `close` (the AI is done)
+// closes it, except a tab the person has in front of them, which becomes theirs.
 await openPipe("c-done", "done");
 const doneTab = [...tabs.values()].find(tab => session.v8TabWorkspaces[tab.id] === "done");
 assert.ok(doneTab, "an engine with no tab gets one background tab");
 closePipe("c-done");
 await new Promise(resolve => setTimeout(resolve, 20));
-assert.ok(!tabs.has(doneTab.id), "the work space's tab closes when its engine leaves");
-console.log("  PASS  an engine that leaves closes its work space's tabs");
+assert.ok(tabs.has(doneTab.id), "an engine that leaves on its own keeps its tab");
+const viewed = await createControlledTab("https://captcha.test/", "done");
+tabs.get(viewed.id).active = true;
+assert.deepEqual(await closeWorkspaceTabs("done"), [doneTab.id], "close closes the work space's tabs");
+assert.ok(tabs.has(viewed.id) && session.v8TabWorkspaces[viewed.id] === undefined, "the tab the person is looking at stays and becomes theirs");
+console.log("  PASS  close closes the work space's tabs; the one the person is looking at becomes theirs");
 
 // "busy" has an engine; "default" lost its relay socket at t0 (its tabs wait for the engine to return).
 await openPipe("c-busy", "busy");

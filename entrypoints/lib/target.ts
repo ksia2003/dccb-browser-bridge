@@ -44,6 +44,11 @@ export async function ownerOf(tabId: number): Promise<string | null> {
   return (await loadOwners())[tabId] ?? null;
 }
 
+/** The person took this AI tab (it was in front when the AI let go): it is theirs from now on. */
+export function releaseTab(tabId: number): Promise<void> {
+  return setOwner(tabId, null);
+}
+
 /** Every open tab the AI opened, with its work space. */
 export async function listAiTabs(): Promise<{ tab: chrome.tabs.Tab; workspace: string }[]> {
   const current = await loadOwners();

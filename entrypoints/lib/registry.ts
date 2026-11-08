@@ -1,7 +1,8 @@
 /**
  * DCCB Browser Bridge — tool registry + dispatcher for the few tools the extension itself serves
- * (6.0.0): `fetch` (a request with the person's cookies, no tab) and `extension` (version /
- * reload). Page work goes through the pipe (lib/pipe.ts); anything for the person goes through chat.
+ * (6.0.0): `fetch` (a request with the person's cookies, no tab), `close` (the AI is done with a work
+ * space) and `extension` (version / reload). Page work goes through the pipe (lib/pipe.ts); anything
+ * for the person goes through chat.
  *
  * `dispatch` runs the tool and normalises the outcome into a `ToolResponse` ({result} or
  * {error}). It never throws, so the caller can always forward what it returns to the relay.

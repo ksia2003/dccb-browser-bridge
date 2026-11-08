@@ -31,7 +31,7 @@
 //     leaves Page.captureScreenshot unanswered, so each click cost 3 × 2 s (owner PC 11-07).
 
 import * as cdp from "./cdp";
-import { createControlledTab, isControlledTab, listAiTabs, listDccbTabs, normalizeWorkspace } from "./target";
+import { createControlledTab, isControlledTab, listAiTabs, listDccbTabs, normalizeWorkspace, releaseTab } from "./target";
 import type { PipeCommand, PipeEvent, PipeResponse } from "../../shared/protocol";
 
 type Send = (frame: PipeResponse | PipeEvent) => void;
@@ -71,20 +71,43 @@ async function touchWorkspace(workspace: string): Promise<void> {
   await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
 }
 
+/**
+ * Let go of AI tabs: a tab the person has in front of them (they brought it forward to log in or
+ * solve a captcha, or to look at the result) becomes theirs; the rest close.
+ */
+async function letGo(tabs: chrome.tabs.Tab[]): Promise<number[]> {
+  const closing: number[] = [];
+  for (const tab of tabs) {
+    if (tab.id === undefined) continue;
+    if (tab.active) await releaseTab(tab.id);
+    else closing.push(tab.id);
+  }
+  if (closing.length) await chrome.tabs.remove(closing).catch(error => console.log("[bb pipe] closing AI tabs failed", String(error)));
+  return closing;
+}
+
+/** The AI is done with a work space (`pc-browser close`): its tabs close now. */
+export async function closeWorkspaceTabs(workspaceValue: unknown): Promise<number[]> {
+  const workspace = normalizeWorkspace(workspaceValue);
+  const closed = await letGo(await listDccbTabs(workspace));
+  onChange();
+  return closed;
+}
+
 /** Close the AI tabs of every work space no engine has used for IDLE_CLOSE_MS. */
 export async function closeIdleAiTabs(now = Date.now()): Promise<number[]> {
   const stored = ((await chrome.storage.session.get(LAST_USE_KEY))[LAST_USE_KEY] ?? {}) as Record<string, number>;
   const busy = new Set([...channels.values()].map(entry => entry.workspace));
-  const closing: number[] = [];
+  const idle: chrome.tabs.Tab[] = [];
   let changed = false;
   for (const { tab, workspace } of await listAiTabs()) {
     if (busy.has(workspace)) continue;
     // A tab from before this clock started (a service worker that lost it) waits a full period.
     if (stored[workspace] === undefined) { stored[workspace] = now; changed = true; continue; }
-    if (now - stored[workspace] >= IDLE_CLOSE_MS && tab.id !== undefined) closing.push(tab.id);
+    if (now - stored[workspace] >= IDLE_CLOSE_MS) idle.push(tab);
   }
   if (changed) await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
-  if (closing.length) await chrome.tabs.remove(closing).catch(error => console.log("[bb pipe] idle close failed", String(error)));
+  const closing = await letGo(idle);
   return closing;
 }
 
@@ -182,21 +205,13 @@ export function closePipe(channel: string): void {
   const entry = channels.get(channel);
   if (!entry) return;
   channels.delete(channel);
-  // The engine left (`pc-browser close`, or its daemon ended): the AI is done with this work space,
-  // so its tabs close (owner 11-08). agent-browser only disconnects on close; it sends no
-  // Browser.close to a browser it did not launch. A dropped relay socket is not this (closeAllPipes).
-  if ([...channels.values()].some(other => other.workspace === entry.workspace)) return;
-  void listDccbTabs(entry.workspace)
-    .then(tabs => tabs.length ? chrome.tabs.remove(tabs.map(tab => tab.id!)) : undefined)
-    .catch(error => console.log("[bb pipe] closing the work space's tabs failed", String(error)))
-    .then(() => touchWorkspace(entry.workspace))
-    .then(onChange);
+  // The engine left. After `pc-browser close` the tabs are already gone (closeWorkspaceTabs); an
+  // engine that ended on its own (pc-browser's 3 idle minutes, a crash) may be back, so its tabs
+  // stay and closeIdleAiTabs closes them if it is not.
+  void touchWorkspace(entry.workspace).then(onChange);
 }
 
-/**
- * The relay socket closed (relay restart, network, service worker): the engines may come back, so
- * the tabs stay; closeIdleAiTabs closes them if none does.
- */
+/** The relay socket closed (relay restart, network, service worker): the same as every engine leaving. */
 export function closeAllPipes(): void {
   const workspaces = new Set([...channels.values()].map(entry => entry.workspace));
   channels.clear();

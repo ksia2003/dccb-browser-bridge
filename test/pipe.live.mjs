@@ -117,8 +117,11 @@ try {
 
   // close closes the AI tab (no idle tab left behind); the next task opens one background tab.
   assert.equal((await aiTabs()).length, 1, "one AI tab while the engine works");
+  // pc-browser close = agent-browser close (only disconnects) + the extension's close tool.
   assert.ok(ab("close").ok);
   await sleep(500);
+  assert.equal((await aiTabs()).length, 1, "an engine that disconnects keeps its tab for when it comes back");
+  assert.equal((await control("/send", { tool: "close", args: { workspace: "live" } })).result?.closed?.length, 1);
   assert.deepEqual(await aiTabs(), [], "close closes the AI tab; nothing is left behind");
   assert.ok(ab("--cdp", cdp, "open", "https://example.org/?again").ok);
   assert.equal((await aiTabs()).length, 1, "the next task opens one background tab");
