@@ -17,7 +17,6 @@ type Request =
   | { type: "setup"; address: string; code: string }
   | { type: "setDeviceName"; name: string };
 
-const STORE_URL = "https://chromewebstore.google.com/detail/gphieniaobkdapliaeihgmhhphcfbafp";
 // A Web Store install carries update_url and Chrome updates it by itself; an unpacked copy does not.
 const fromStore = Boolean((chrome.runtime.getManifest() as { update_url?: string }).update_url);
 
@@ -90,11 +89,8 @@ function render(s: PopupSnapshot): void {
     update.replaceChildren();
     const strong = document.createElement("b");
     strong.textContent = `새 버전 ${latest}이 나왔어요.`;
-    const link = document.createElement("a");
-    link.href = STORE_URL;
-    link.target = "_blank";
-    link.textContent = "Chrome 웹스토어에서 설치";
-    update.append(strong, document.createElement("br"), link, "하면 이후로는 알아서 업데이트됩니다.");
+    // Until the Web Store copy is published, an unpacked copy updates from the dashboard ZIP.
+    update.append(strong, document.createElement("br"), "DCCB 대시보드 Browser Bridge 카드의 ZIP을 지금 확장 폴더에 덮어쓰고 chrome://extensions에서 ↻를 누르세요.");
   }
 }
 
