@@ -55,10 +55,12 @@ export async function releaseTab(tabId: number): Promise<void> {
 }
 
 /**
- * Work spaces whose last AI tab the person closed. The AI may not open another until it has asked
- * (owner 11-08); `close` (the AI finishing) clears it. Tabs the bridge closes itself are expected.
+ * Work spaces the person stopped: they closed its last AI tab, or pressed Cancel on Chrome's
+ * debugging bar. The AI may not open or attach to a tab again until it has asked (owner 11-08);
+ * `close` (the AI finishing) clears it. Tabs the bridge closes itself are expected, not the person.
  */
-const PERSON_CLOSED_KEY = "v8PersonClosedWorkspaces";
+export type PersonStop = "closed" | "cancelled";
+const PERSON_STOP_KEY = "v8PersonStoppedWorkspaces";
 const expectedRemovals = new Set<number>();
 /** Close AI tabs on the AI's behalf (the engine's tab close, `close`): not the person closing them. */
 export async function removeAiTabs(tabIds: number[]): Promise<void> {
@@ -66,19 +68,23 @@ export async function removeAiTabs(tabIds: number[]): Promise<void> {
   try { await chrome.tabs.remove(tabIds); }
   finally { for (const id of tabIds) setTimeout(() => expectedRemovals.delete(id), 5_000); }
 }
-async function personClosed(): Promise<Set<string>> {
-  return new Set(((await chrome.storage.session.get(PERSON_CLOSED_KEY))[PERSON_CLOSED_KEY] as string[] | undefined) ?? []);
+async function personStops(): Promise<Record<string, PersonStop>> {
+  return ((await chrome.storage.session.get(PERSON_STOP_KEY))[PERSON_STOP_KEY] as Record<string, PersonStop> | undefined) ?? {};
+}
+/** How the person stopped this work space (and the AI has not finished since), or null. */
+export async function stoppedByPerson(workspace: unknown): Promise<PersonStop | null> {
+  return (await personStops())[normalizeWorkspace(workspace)] ?? null;
 }
 /** Did the person close this work space's last AI tab (and the AI has not finished since)? */
 export async function closedByPerson(workspace: unknown): Promise<boolean> {
-  return (await personClosed()).has(normalizeWorkspace(workspace));
+  return await stoppedByPerson(workspace) === "closed";
 }
-export async function setClosedByPerson(workspace: unknown, value: boolean): Promise<void> {
-  const current = await personClosed();
+export async function setStoppedByPerson(workspace: unknown, stop: PersonStop | null): Promise<void> {
+  const current = await personStops();
   const name = normalizeWorkspace(workspace);
-  if (current.has(name) === value) return;
-  if (value) current.add(name); else current.delete(name);
-  await chrome.storage.session.set({ [PERSON_CLOSED_KEY]: [...current] });
+  if ((current[name] ?? null) === stop) return;
+  if (stop === null) delete current[name]; else current[name] = stop;
+  await chrome.storage.session.set({ [PERSON_STOP_KEY]: current });
 }
 async function noticeRemoval(tabId: number): Promise<void> {
   const workspace = await ownerOf(tabId);
@@ -86,7 +92,7 @@ async function noticeRemoval(tabId: number): Promise<void> {
   await setOwner(tabId, null);
   if (expectedRemovals.delete(tabId)) return;
   if ((await listDccbTabs(workspace)).length === 0) {
-    await setClosedByPerson(workspace, true);
+    await setStoppedByPerson(workspace, "closed");
     log("the person closed the work space's last AI tab", { workspace });
   }
 }
@@ -200,15 +206,15 @@ export async function focusPopupTarget(): Promise<boolean> {
 }
 
 /**
- * Before 6.0.0 the AI's tabs sat in an "AI · <device>" tab group kept alive by an idle tab. On the
- * first run of 6.0.0, close the idle tabs and ungroup what is left of those groups, so nothing new
- * reaches Chrome's saved-groups bar. Labels Chrome already saved there stay (no API removes them).
+ * Before 6.0.0 the AI's tabs sat in an "AI · <device>" tab group kept alive by an idle tab. On every
+ * start, close such idle tabs and ungroup what is left of those groups, so nothing new reaches
+ * Chrome's saved-groups bar. Only 1.2.x leaves either behind, so this finds nothing afterwards, and
+ * it also covers going back to 1.2.x and up again. Labels Chrome already saved there stay (no API
+ * removes them).
  */
-const MIGRATED_KEY = "v8Migrated600";
 const RETIRED_KEYS = ["v8ClientGroups", "v8ClientWindows", "v8DedicatedWindow", "v8BrowserBridgeHandoff", "v8BrowserBridgeHandoffMessage", "v8BrowserBridgeActivity"];
 export async function migrateFromTabGroups(): Promise<void> {
-  const stored = await chrome.storage.local.get([MIGRATED_KEY, "v8ClientGroups"]);
-  if (stored[MIGRATED_KEY] === true) return;
+  const stored = await chrome.storage.local.get(["v8ClientGroups"]);
   const idlePage = chrome.runtime.getURL("/idle.html");
   const tabs = await chrome.tabs.query({});
   const groups = new Set<number>(Object.values((stored.v8ClientGroups ?? {}) as Record<string, unknown>).filter((id): id is number => typeof id === "number"));
@@ -217,9 +223,8 @@ export async function migrateFromTabGroups(): Promise<void> {
   const grouped = tabs.filter(tab => tab.id !== undefined && tab.groupId !== undefined && groups.has(tab.groupId) && !idle.includes(tab.id)).map(tab => tab.id!);
   if (grouped.length) await chrome.tabs.ungroup(grouped).catch(error => log("ungroup failed", String(error)));
   if (idle.length) await chrome.tabs.remove(idle).catch(error => log("idle tab close failed", String(error)));
-  await chrome.storage.local.remove(RETIRED_KEYS);
-  await chrome.storage.local.set({ [MIGRATED_KEY]: true });
-  log("left the tab group behind", { ungrouped: grouped.length, idleClosed: idle.length });
+  await chrome.storage.local.remove([...RETIRED_KEYS, "v8Migrated600"]);
+  if (grouped.length || idle.length) log("left the tab group behind", { ungrouped: grouped.length, idleClosed: idle.length });
 }
 
 function log(...args: unknown[]): void {

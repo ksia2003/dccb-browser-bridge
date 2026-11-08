@@ -826,7 +826,7 @@ async function handleEnrollmentRedeem(req: IncomingMessage, res: ServerResponse)
   }
   const result = enrollment.redeem(body.setup_code, body.stable_browser_id);
   if (!result.ok) {
-    const status = result.error === "expired_code" || result.error === "used_code" ? 400
+    const status = result.error === "expired_code" || result.error === "used_code" || result.error === "unknown_code" ? 400
       : result.error === "route_unavailable" ? 503 : 409;
     log(`enrollment refused: ${result.error}`);
     writeJson(res, status, { error: result.error });

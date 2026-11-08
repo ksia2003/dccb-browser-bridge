@@ -248,14 +248,15 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
         let route: PublicDoorRoute | undefined;
         for (const [key, store] of stores) {
           const result = store.redeem(body.setup_code, body.stable_browser_id);
-          if (result.ok || result.error !== "route_unavailable") {
+          // A code this route does not hold is another route's (or no one's): keep looking.
+          if (result.ok || (result.error !== "route_unavailable" && result.error !== "unknown_code")) {
             redeemed = result;
             route = routes.get(key);
             break;
           }
         }
         if (!redeemed || !redeemed.ok || !route) {
-          const error = redeemed?.error ?? "route_unavailable";
+          const error = redeemed?.error ?? "unknown_code";
           json(res, error === "route_unavailable" ? 503 : error === "route_mismatch" ? 409 : 400, { error });
           return;
         }

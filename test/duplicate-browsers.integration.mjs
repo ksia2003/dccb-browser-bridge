@@ -27,8 +27,15 @@ const relay = spawn(process.execPath, [join(root, "node_modules/tsx/dist/cli.mjs
 
 /** A fake extension that says its version and answers every tool with its own name. */
 async function extension(id, version) {
-  const socket = new WebSocket(`ws://127.0.0.1:${wsPort}/ws?id=${id}&name=Chrome`, { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
-  await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+  // The relay may still be starting on a busy machine: retry the connection for a while.
+  let socket;
+  for (let attempt = 0; ; attempt++) {
+    socket = new WebSocket(`ws://127.0.0.1:${wsPort}/ws?id=${id}&name=Chrome`, { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
+    const opened = await new Promise(resolve => { socket.once("open", () => resolve(true)); socket.once("error", () => resolve(false)); });
+    if (opened) break;
+    if (attempt >= 50) throw new Error("the isolated relay did not accept connections");
+    await sleep(200);
+  }
   socket.send(JSON.stringify({ type: "extension_hello", version }));
   socket.on("message", data => {
     const message = JSON.parse(String(data));

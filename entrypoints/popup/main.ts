@@ -105,6 +105,8 @@ async function ask(request: Request): Promise<void> {
 function closeMenu(): void {
   menu.hidden = true;
   more.setAttribute("aria-expanded", "false");
+  byId("reset").hidden = false;
+  byId("reset-confirm").hidden = true;
 }
 
 function connect(): void {
@@ -148,8 +150,14 @@ byId("name-form").addEventListener("submit", event => {
   void ask({ type: "setDeviceName", name: deviceName.value }).then(closeMenu);
 });
 deviceName.addEventListener("change", () => void ask({ type: "setDeviceName", name: deviceName.value }));
+// Ask inside the menu: a browser confirm() looks foreign and can close the extension popup.
 byId("reset").addEventListener("click", () => {
-  if (!confirm("이 Chrome의 연결을 지우고 주소와 코드를 다시 넣을까요?")) return;
+  byId("reset").hidden = true;
+  byId("reset-confirm").hidden = false;
+  byId("reset-no").focus();
+});
+byId("reset-no").addEventListener("click", closeMenu);
+byId("reset-yes").addEventListener("click", () => {
   closeMenu();
   void ask({ type: "reset" });
 });

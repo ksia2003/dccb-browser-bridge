@@ -146,7 +146,8 @@ function harness() {
   const second = await open("/cdp/research");
   assert.equal(second.status, 409);
   first.ws.close();
-  await new Promise(resolve => setTimeout(resolve, 50));
+  // Wait for the close to travel (a loaded machine takes longer than a few milliseconds).
+  for (let i = 0; i < 100 && !sent.some(message => message.type === "pipe_close"); i++) await new Promise(resolve => setTimeout(resolve, 20));
   assert.ok(sent.some(message => message.type === "pipe_close"), "the extension hears that the engine left");
   const again = await open("/cdp/research");
   assert.equal(again.status, 101, "the work space is free again");

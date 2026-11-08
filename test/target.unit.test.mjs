@@ -324,7 +324,7 @@ check(
 );
 tabsById.set(84, { id: 84, groupId: 9, windowId: 1, active: false, url: idle, title: "" });
 await migrateFromTabGroups();
-check("the migration runs once", tabsById.has(84));
+check("going back to 1.2.x and up again is cleaned up as well", !tabsById.has(84) && tabsById.get(83)?.groupId === 6);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) {

@@ -120,10 +120,12 @@ function addressOrigin(raw: string): string {
 function enrollmentError(status: number, body: unknown): string {
   const code = body && typeof body === "object" ? (body as { error?: unknown }).error : undefined;
   switch (code) {
-    case "expired_code": return "코드가 만료되었습니다. 대시보드의 새 코드를 사용하세요";
-    case "used_code": return "이미 사용한 코드입니다. 대시보드의 새 코드를 사용하세요";
-    case "route_mismatch": return "연결 주소가 현재 계정의 relay와 맞지 않습니다";
-    case "route_unavailable": return "브라우저 relay가 아직 준비되지 않았습니다";
+    case "expired_code": return "코드가 만료됐습니다. 대시보드의 지금 코드를 넣어 주세요";
+    case "used_code": return "이미 쓴 코드입니다. 대시보드의 지금 코드를 넣어 주세요";
+    // A mistyped or replaced code: 6.0.0 relays say unknown_code; older ones said route_unavailable.
+    case "unknown_code":
+    case "route_unavailable": return "코드가 맞지 않거나 지난 코드입니다. 대시보드의 지금 코드를 넣어 주세요";
+    case "route_mismatch": return "이 주소와 코드는 서로 다른 서버의 것입니다. 대시보드의 주소와 코드를 함께 넣어 주세요";
     case "invalid_request": return "주소 또는 코드 형식이 올바르지 않습니다";
     default: return `연결 정보를 확인할 수 없습니다 (${status})`;
   }

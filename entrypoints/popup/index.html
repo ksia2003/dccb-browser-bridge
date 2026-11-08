@@ -23,6 +23,8 @@
     .menu button{width:100%;height:36px;border:0;border-radius:6px;background:none;text-align:left;padding:0 12px;cursor:pointer}
     .menu button:hover{background:var(--bg-2)}
     .menu .danger{color:var(--danger)}
+    .menu .confirm{padding:8px 8px 4px}.menu .confirm p{margin:0 0 8px;font-size:12px;line-height:18px;color:var(--fg-2)}
+    .menu .confirm .row{display:flex;gap:8px}.menu .confirm .row button{flex:1;text-align:center;border:1px solid var(--line)}
     .menu form{padding:8px 8px 4px}
     .menu label{display:block;font-size:12px;font-weight:600;color:var(--fg-2);margin-bottom:6px}
     .menu input{width:100%;height:32px;border-radius:6px;border:1px solid var(--line);background:var(--bg-2);padding:0 10px}
@@ -88,6 +90,7 @@
     <div class="menu" id="menu" role="menu" hidden>
       <form id="name-form"><label for="device-name">기기 이름</label><input id="device-name" maxlength="40" autocomplete="off"></form>
       <button class="danger" id="reset" role="menuitem">연결 다시 하기</button>
+      <div class="confirm" id="reset-confirm" hidden><p>이 Chrome의 연결을 지우고 주소와 코드를 다시 넣을까요?</p><div class="row"><button class="danger" id="reset-yes">지우기</button><button id="reset-no">취소</button></div></div>
     </div>
   </header>
 

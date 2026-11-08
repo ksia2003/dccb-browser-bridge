@@ -12,6 +12,7 @@ const session = {};
 const detached = [];
 const onActivated = listeners();
 const onRemoved = listeners();
+const debuggerDetach = listeners();
 globalThis.chrome = {
   runtime: { getURL: path => `chrome-extension://test${path}`, lastError: undefined },
   tabs: {
@@ -24,7 +25,7 @@ globalThis.chrome = {
   },
   windows: { async getLastFocused() { return { id: 1, type: "normal" }; } },
   debugger: {
-    onEvent: listeners(), onDetach: listeners(),
+    onEvent: listeners(), onDetach: debuggerDetach,
     attach(_target, _version, callback) { callback(); },
     detach(target, callback) { detached.push(target.tabId); callback(); },
     sendCommand(_target, _method, _params, callback) { callback({}); },
@@ -95,3 +96,18 @@ await pipe.handlePipeCommand({ type: "pipe_command", channel: "c4", id: 11, meth
 await tick(10);
 assert.equal(await target.closedByPerson("theirs"), false);
 console.log("  PASS  the person closing the AI's last tab stops new tabs until the AI finishes; the AI's own closes do not");
+
+// Cancel on Chrome's debugging bar: the work space stops; the engine cannot quietly re-attach.
+const frames = [];
+pipe.installPipe(frame => frames.push(frame), () => {}, () => null);
+await pipe.openPipe("c5", "cancel");
+const [cancelTab] = await target.listDccbTabs("cancel");
+await pipe.handlePipeCommand({ type: "pipe_command", channel: "c5", id: 20, method: "chrome.debugger.attach", params: [{ tabId: cancelTab.id }] });
+await debuggerDetach.emit({ tabId: cancelTab.id }, "canceled_by_user");
+await tick(10);
+assert.equal(await target.stoppedByPerson("cancel"), "cancelled");
+await pipe.handlePipeCommand({ type: "pipe_command", channel: "c5", id: 21, method: "chrome.debugger.attach", params: [{ tabId: cancelTab.id }] });
+assert.match(frames.at(-1)?.error ?? "", /pressed Cancel on Chrome's debugging bar/);
+await pipe.closeWorkspaceTabs("cancel");
+assert.equal(await target.stoppedByPerson("cancel"), null, "close lifts it");
+console.log("  PASS  Cancel on the debugging bar stops the work space until the AI finishes with close");

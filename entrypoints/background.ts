@@ -16,7 +16,7 @@ import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, popupTarget, setLastWorkspace } from "./lib/target";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, ownerOf, popupTarget, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import "./lib/tools"; // side-effect: registers the tools into the registry
 
@@ -349,6 +349,15 @@ export default defineBackground(() => {
   // webNavigation's sourceTabId; Chrome's own focus change for them is undone.
   installNewTabAdopter();
   installSeenWatch();
+  // The popup shows the AI's page: refresh it when an AI tab's title, address or icon changes.
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  chrome.tabs.onUpdated.addListener((tabId, change) => {
+    if (!("title" in change || "url" in change || "favIconUrl" in change)) return;
+    void ownerOf(tabId).then(owner => {
+      if (owner === null || refreshTimer !== null) return;
+      refreshTimer = setTimeout(() => { refreshTimer = null; pushSnapshot(); }, 300);
+    });
+  });
   installPipe(
     frame => send(frame),
     () => pushSnapshot(),

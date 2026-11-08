@@ -107,6 +107,12 @@ async function fetchFromChrome(args: ToolArgs): Promise<unknown> {
     };
   } catch (error) {
     if (controller?.signal.aborted) throw new Error(`fetch: timed out after ${timeoutMs}ms`);
+    // With its site access limited (Chrome's "on click" / specific sites) the extension cannot read
+    // other sites; only the person can open it again.
+    const limited = await Promise.resolve().then(() => chrome.permissions.contains({ origins: ["<all_urls>"] })).then(ok => !ok, () => false);
+    if (limited) {
+      throw new Error("fetch: Browser Bridge's site access is limited in this Chrome. Ask the person to set it to all sites: chrome://extensions → Browser Bridge → 세부정보 → 사이트 액세스 → 모든 사이트에서.");
+    }
     throw new Error(`fetch: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     if (timeout) clearTimeout(timeout);

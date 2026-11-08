@@ -32,7 +32,7 @@
 //     leaves Page.captureScreenshot unanswered, so each click cost 3 × 2 s (owner PC 11-07).
 
 import * as cdp from "./cdp";
-import { closedByPerson, createControlledTab, isControlledTab, listDccbTabs, normalizeWorkspace, releaseTab, removeAiTabs, setClosedByPerson, wasSeen } from "./target";
+import { createControlledTab, isControlledTab, listDccbTabs, normalizeWorkspace, releaseTab, removeAiTabs, setStoppedByPerson, stoppedByPerson, wasSeen } from "./target";
 import type { PipeCommand, PipeEvent, PipeResponse } from "../../shared/protocol";
 
 type Send = (frame: PipeResponse | PipeEvent) => void;
@@ -75,14 +75,21 @@ async function letGo(tabs: chrome.tabs.Tab[]): Promise<number[]> {
 }
 
 /** The AI is done with a work space (`pc-browser close`): its tabs close now. */
-/** What the engine hears when it tries to open a tab after the person closed the AI's last one. */
-export const PERSON_CLOSED_MESSAGE = "the person closed the AI's tab. Ask them in chat whether to go on; if they agree, run pc-browser close and start again.";
+/** What the engine hears after the person stopped the work space (it may not open or attach again). */
+export const PERSON_STOP_MESSAGES = {
+  closed: "the person closed the AI's tab. Ask them in chat whether to go on; if they agree, run pc-browser close and start again.",
+  cancelled: "the person pressed Cancel on Chrome's debugging bar to stop the AI. Ask them in chat whether to go on; if they agree, run pc-browser close and start again.",
+} as const;
+async function refuseIfStopped(workspace: string): Promise<void> {
+  const stop = await stoppedByPerson(workspace);
+  if (stop) throw new Error(PERSON_STOP_MESSAGES[stop]);
+}
 
 export async function closeWorkspaceTabs(workspaceValue: unknown): Promise<number[]> {
   const workspace = normalizeWorkspace(workspaceValue);
   const closed = await letGo(await listDccbTabs(workspace));
-  // The AI finished; whatever the person closed before, the next task may open a tab again.
-  await setClosedByPerson(workspace, false);
+  // The AI finished; whatever the person stopped before, the next task may start again.
+  await setStoppedByPerson(workspace, null);
   onChange();
   return closed;
 }
@@ -129,6 +136,8 @@ export function installPipe(sendFrame: Send, changed: () => void, refuse: () => 
     for (const [id, channel] of channels) {
       if (!channel.attached.delete(source.tabId)) continue;
       event(id, "chrome.debugger.onDetach", [source, reason]);
+      // Cancel on the debugging bar is the person saying stop: no quiet re-attach (owner 11-08).
+      if (reason === "canceled_by_user") void setStoppedByPerson(channel.workspace, "cancelled");
     }
   });
   chrome.tabs.onCreated.addListener(tab => {
@@ -160,7 +169,7 @@ export async function openPipe(channel: string, workspaceValue: string): Promise
     let tabs = (await listDccbTabs(workspace)).filter(debuggable);
     // No tab to give back: open one, unless the person closed the last one (the engine then hears
     // why when it tries to open a page).
-    if (tabs.length === 0 && !(await closedByPerson(workspace))) tabs = [await createControlledTab("about:blank", workspace)];
+    if (tabs.length === 0 && !(await stoppedByPerson(workspace))) tabs = [await createControlledTab("about:blank", workspace)];
     for (const tab of tabs) {
       entry.known.add(tab.id!);
       event(channel, "chrome.tabs.onCreated", [tabForWire(tab)]);
@@ -288,6 +297,7 @@ async function captureScreenshot(tabId: number, params: Record<string, unknown>)
 async function run(channelId: string, entry: Channel, method: string, params: unknown[]): Promise<unknown> {
   switch (method) {
     case "chrome.debugger.attach": {
+      await refuseIfStopped(entry.workspace);
       const tabId = await owned(entry, (params[0] as { tabId?: unknown })?.tabId);
       await cdp.ensureAttached(tabId);
       entry.attached.add(tabId);
@@ -311,7 +321,7 @@ async function run(channelId: string, entry: Channel, method: string, params: un
       return await cdp.send(tabId, cdpMethod, cdpParams, target.sessionId) ?? {};
     }
     case "chrome.tabs.create": {
-      if (await closedByPerson(entry.workspace)) throw new Error(PERSON_CLOSED_MESSAGE);
+      await refuseIfStopped(entry.workspace);
       const url = (params[0] as { url?: string } | undefined)?.url;
       const tab = await createControlledTab(url || "about:blank", entry.workspace);
       entry.known.add(tab.id!);

@@ -28,6 +28,7 @@ export type EnrollmentError =
   | "route_mismatch"
   | "expired_code"
   | "used_code"
+  | "unknown_code"
   | "route_unavailable";
 
 export interface EnrollmentResult<T> {
@@ -112,7 +113,7 @@ export class BrowserBridgeEnrollmentStore {
   redeem(setupCode: string, browserId: string): EnrollmentResult<RedeemedSetupCode> {
     if (!validBrowserId(browserId)) return { ok: false, error: "invalid_request" };
     const record = this.codes.get(normalizeCode(setupCode));
-    if (!record) return { ok: false, error: "route_unavailable" };
+    if (!record) return { ok: false, error: "unknown_code" };
     const now = this.now();
     if (record.expiresAt <= now) {
       this.codes.delete(normalizeCode(setupCode));
