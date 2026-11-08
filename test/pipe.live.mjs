@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,8 +33,10 @@ const children = [];
 const session = `bb-pipe-live-${process.pid}`;
 
 function extensionId() {
+  // A store build (BB_STORE_BUILD=1) has no key; Chrome then derives the id from the unpacked path.
   const key = JSON.parse(readFileSync(join(extensionDir, "manifest.json"), "utf8")).key;
-  return [...createHash("sha256").update(Buffer.from(key, "base64")).digest("hex").slice(0, 32)].map(c => String.fromCharCode(97 + parseInt(c, 16))).join("");
+  const source = key ? Buffer.from(key, "base64") : Buffer.from(realpathSync(extensionDir));
+  return [...createHash("sha256").update(source).digest("hex").slice(0, 32)].map(c => String.fromCharCode(97 + parseInt(c, 16))).join("");
 }
 
 function evaluate(wsUrl, expression) {
