@@ -51,8 +51,8 @@
     .card .go{color:var(--fg-3);flex:none}
     .form{padding:0 16px 16px}
     .form label{display:block;font-size:12px;font-weight:600;color:var(--fg-2);margin:12px 0 6px}
-    .form input{width:100%;height:40px;border-radius:8px;border:1px solid var(--line);background:var(--bg-2);padding:0 12px;font-size:14px}
-    .form input:focus{outline:2px solid var(--brand);outline-offset:-1px;background:var(--bg)}
+    .form textarea{display:block;width:100%;border-radius:8px;border:1px solid var(--line);background:var(--bg-2);padding:10px 12px;font-size:14px;line-height:20px;resize:none}
+    .form textarea:focus{outline:2px solid var(--brand);outline-offset:-1px;background:var(--bg)}
     .primary{width:100%;height:40px;margin-top:16px;border:0;border-radius:8px;background:var(--brand);color:#fff;font-size:14px;font-weight:700;cursor:pointer}
     .primary:disabled{opacity:.6;cursor:default}
     .error{color:var(--danger);font-size:12px;line-height:16px;margin:8px 0 0}
@@ -62,6 +62,9 @@
     .dev{display:flex;align-items:center;gap:6px;color:var(--fg-2);min-width:0}
     .dev span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+    /* The setup page a fresh install opens (popup.html?welcome=1): the same card, centred on a page. */
+    html.page{min-height:100%;background:var(--bg-2)}
+    html.page body{width:360px;margin:72px auto;border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
     [hidden]{display:none!important}
   </style>
 </head>
@@ -94,11 +97,12 @@
       <p class="desc">DCCB 대시보드의 주소와 코드를 넣으면<br>이후로는 알아서 연결됩니다.</p>
     </div>
     <form class="form" id="setup-form">
-      <label for="address">주소</label><input id="address" type="url" placeholder="https://…" autocomplete="off" spellcheck="false">
-      <label for="code">코드</label><input id="code" type="text" placeholder="Q7M2 K9TX" autocomplete="off" spellcheck="false">
+      <label for="pair">연결 정보</label>
+      <textarea id="pair" rows="3" placeholder="대시보드의 주소와 코드를 한 번에 복사해 붙여 넣으세요" autocomplete="off" spellcheck="false"></textarea>
       <p class="error" id="setup-error" hidden></p>
       <button class="primary" id="connect" type="submit">연결</button>
     </form>
+    <p class="notice" id="pin-hint" hidden><b>아이콘을 늘 보이게 하려면</b><br>크롬 오른쪽 위 퍼즐 조각(확장 프로그램)을 누르고 Browser Bridge 옆 압정을 누르세요.</p>
   </section>
 
   <section id="status" hidden>
@@ -109,10 +113,11 @@
     </div>
     <button class="card" id="card" type="button" hidden>
       <span class="fav" id="fav"></span>
-      <span class="text"><span class="k">지금 보는 페이지 · 누르면 이동</span><span class="t" id="page-title"></span><span class="u" id="page-host"></span></span>
+      <span class="text"><span class="k" id="page-label">지금 보는 페이지 · 누르면 이동</span><span class="t" id="page-title"></span><span class="u" id="page-host"></span></span>
       <svg class="go" width="16" height="16"><use href="#chev"/></svg>
     </button>
     <p class="notice" id="update" hidden></p>
+    <p class="notice" id="welcome-done" hidden>연결됐습니다. 이 탭은 닫아도 됩니다.</p>
   </section>
 
   <footer class="ft"><span class="dev"><span class="dot" id="dev-dot"></span><span id="device"></span></span><span id="version"></span></footer>

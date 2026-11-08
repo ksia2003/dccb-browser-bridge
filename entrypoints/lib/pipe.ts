@@ -20,8 +20,9 @@
 // Modified by DCCB (2026-11-06) — Browser Bridge 1.1.0 pipe:
 //   - frames ride Browser Bridge's relay WebSocket as pipe_* messages, one channel per engine;
 //   - a channel may attach only to the tabs the AI opened for its work space (lib/target.ts; the
-//     original accepts any tabId); an engine that reconnects after a dropped socket gets those tabs
-//     back instead of a new one (owner 11-06), and they close when the engine leaves (6.0.0);
+//     original accepts any tabId); the next engine of the work space gets those tabs back instead
+//     of a new one (owner 11-06); they close only when the AI says it is done, and not once the
+//     person has looked at them (6.0.0, owner 11-08);
 //   - attach goes through lib/cdp.ts: focus emulation, the mute guard, Bridge on/off;
 //   - Input.* goes through cdp.sendInput (Claude in Chrome's draw-if-held, 5 s acknowledgement:
 //     an unacknowledged input is an error, never a silent "done");
@@ -31,7 +32,7 @@
 //     leaves Page.captureScreenshot unanswered, so each click cost 3 × 2 s (owner PC 11-07).
 
 import * as cdp from "./cdp";
-import { createControlledTab, isControlledTab, listAiTabs, listDccbTabs, normalizeWorkspace, releaseTab } from "./target";
+import { closedByPerson, createControlledTab, isControlledTab, listDccbTabs, normalizeWorkspace, releaseTab, removeAiTabs, setClosedByPerson, wasSeen } from "./target";
 import type { PipeCommand, PipeEvent, PipeResponse } from "../../shared/protocol";
 
 type Send = (frame: PipeResponse | PipeEvent) => void;
@@ -59,57 +60,33 @@ const SCREENCAST_WAIT_MS = 8_000;
 const DRAW_FRAME_WAIT_MS = 2_000;
 
 /**
- * A work space's tabs close this long after its last engine went away (6.0.0): the AI is told to
- * close them when it is done, and this covers the time it does not. Kept in session storage so a
- * service worker restart keeps the clock.
- */
-export const IDLE_CLOSE_MS = 10 * 60_000;
-const LAST_USE_KEY = "v8WorkspaceLastUse";
-async function touchWorkspace(workspace: string): Promise<void> {
-  const stored = ((await chrome.storage.session.get(LAST_USE_KEY))[LAST_USE_KEY] ?? {}) as Record<string, number>;
-  stored[workspace] = Date.now();
-  await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
-}
-
-/**
- * Let go of AI tabs: a tab the person has in front of them (they brought it forward to log in or
- * solve a captcha, or to look at the result) becomes theirs; the rest close.
+ * The AI is done: a tab the person has looked at (to log in, solve a captcha, see the result) or
+ * has in front of them now becomes theirs; the rest close.
  */
 async function letGo(tabs: chrome.tabs.Tab[]): Promise<number[]> {
   const closing: number[] = [];
   for (const tab of tabs) {
     if (tab.id === undefined) continue;
-    if (tab.active) await releaseTab(tab.id);
+    if (tab.active || await wasSeen(tab.id)) await releaseTab(tab.id);
     else closing.push(tab.id);
   }
-  if (closing.length) await chrome.tabs.remove(closing).catch(error => console.log("[bb pipe] closing AI tabs failed", String(error)));
+  if (closing.length) await removeAiTabs(closing).catch(error => console.log("[bb pipe] closing AI tabs failed", String(error)));
   return closing;
 }
 
 /** The AI is done with a work space (`pc-browser close`): its tabs close now. */
+/** What the engine hears when it tries to open a tab after the person closed the AI's last one. */
+export const PERSON_CLOSED_MESSAGE = "the person closed the AI's tab. Ask them in chat whether to go on; if they agree, run pc-browser close and start again.";
+
 export async function closeWorkspaceTabs(workspaceValue: unknown): Promise<number[]> {
   const workspace = normalizeWorkspace(workspaceValue);
   const closed = await letGo(await listDccbTabs(workspace));
+  // The AI finished; whatever the person closed before, the next task may open a tab again.
+  await setClosedByPerson(workspace, false);
   onChange();
   return closed;
 }
 
-/** Close the AI tabs of every work space no engine has used for IDLE_CLOSE_MS. */
-export async function closeIdleAiTabs(now = Date.now()): Promise<number[]> {
-  const stored = ((await chrome.storage.session.get(LAST_USE_KEY))[LAST_USE_KEY] ?? {}) as Record<string, number>;
-  const busy = new Set([...channels.values()].map(entry => entry.workspace));
-  const idle: chrome.tabs.Tab[] = [];
-  let changed = false;
-  for (const { tab, workspace } of await listAiTabs()) {
-    if (busy.has(workspace)) continue;
-    // A tab from before this clock started (a service worker that lost it) waits a full period.
-    if (stored[workspace] === undefined) { stored[workspace] = now; changed = true; continue; }
-    if (now - stored[workspace] >= IDLE_CLOSE_MS) idle.push(tab);
-  }
-  if (changed) await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
-  const closing = await letGo(idle);
-  return closing;
-}
 
 export function pipeChannelCount(): number {
   return channels.size;
@@ -181,13 +158,14 @@ export async function openPipe(channel: string, workspaceValue: string): Promise
     const entry: Channel = { workspace, attached: new Set(), known: new Set(), screencasts: new Set() };
     channels.set(channel, entry);
     let tabs = (await listDccbTabs(workspace)).filter(debuggable);
-    if (tabs.length === 0) tabs = [await createControlledTab("about:blank", workspace)];
+    // No tab to give back: open one, unless the person closed the last one (the engine then hears
+    // why when it tries to open a page).
+    if (tabs.length === 0 && !(await closedByPerson(workspace))) tabs = [await createControlledTab("about:blank", workspace)];
     for (const tab of tabs) {
       entry.known.add(tab.id!);
       event(channel, "chrome.tabs.onCreated", [tabForWire(tab)]);
     }
     event(channel, "extension.initialized", []);
-    await touchWorkspace(workspace);
     onChange();
   } catch (error) {
     channels.delete(channel);
@@ -205,17 +183,25 @@ export function closePipe(channel: string): void {
   const entry = channels.get(channel);
   if (!entry) return;
   channels.delete(channel);
-  // The engine left. After `pc-browser close` the tabs are already gone (closeWorkspaceTabs); an
-  // engine that ended on its own (pc-browser's 3 idle minutes, a crash) may be back, so its tabs
-  // stay and closeIdleAiTabs closes them if it is not.
-  void touchWorkspace(entry.workspace).then(onChange);
-}
+  // The engine left (pc-browser's 3 idle minutes, a crash, or before `close`). Its tabs stay for the
+  // next engine of this work space; nothing closes on a timer (owner 11-08). The debugger lets go so
+  // Chrome's "started debugging" bar goes away; the next engine attaches again.
+  releaseDebugger(entry);
+  onChange();}
 
 /** The relay socket closed (relay restart, network, service worker): the same as every engine leaving. */
 export function closeAllPipes(): void {
-  const workspaces = new Set([...channels.values()].map(entry => entry.workspace));
+  const entries = [...channels.values()];
   channels.clear();
-  void Promise.all([...workspaces].map(touchWorkspace)).then(onChange);
+  for (const entry of entries) releaseDebugger(entry);
+  onChange();
+}
+
+/** Detach from the tabs a gone engine was attached to, unless another engine still uses them. */
+function releaseDebugger(entry: Channel): void {
+  const inUse = new Set([...channels.values()].flatMap(other => [...other.attached]));
+  for (const tabId of entry.attached) if (!inUse.has(tabId)) void cdp.detach(tabId).catch(() => undefined);
+  entry.attached.clear();
 }
 
 async function owned(entry: Channel, tabId: unknown): Promise<number> {
@@ -325,6 +311,7 @@ async function run(channelId: string, entry: Channel, method: string, params: un
       return await cdp.send(tabId, cdpMethod, cdpParams, target.sessionId) ?? {};
     }
     case "chrome.tabs.create": {
+      if (await closedByPerson(entry.workspace)) throw new Error(PERSON_CLOSED_MESSAGE);
       const url = (params[0] as { url?: string } | undefined)?.url;
       const tab = await createControlledTab(url || "about:blank", entry.workspace);
       entry.known.add(tab.id!);
@@ -333,7 +320,7 @@ async function run(channelId: string, entry: Channel, method: string, params: un
     case "chrome.tabs.remove": {
       const ids = [params[0]].flat();
       for (const id of ids) await owned(entry, id);
-      await chrome.tabs.remove(ids as number[]);
+      await removeAiTabs(ids as number[]);
       return {};
     }
   }

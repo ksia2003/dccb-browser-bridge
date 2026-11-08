@@ -40,7 +40,7 @@ shot.convert("RGB").save(out / "screenshot-1-working.png")
 canvas = Image.new("RGBA", (1280, 800), (241, 243, 244, 255))
 draw = ImageDraw.Draw(canvas)
 text(draw, (640, 92), "내 서버의 AI가 내 Chrome에서 일합니다", 40, True, (22, 24, 29), "mm")
-text(draw, (640, 146), "한 번 연결하면 끝. AI는 뒤쪽 탭에서 일하고, 내 탭은 건드리지 않습니다.", 22, False, (92, 99, 112), "mm")
+text(draw, (640, 146), "한 번 붙여 넣으면 연결 끝. AI는 뒤쪽 탭에서 일하고, 내 탭은 건드리지 않습니다.", 22, False, (92, 99, 112), "mm")
 names = [("setup", "① 처음 한 번 연결"), ("connected", "② 평소"), ("working", "③ AI가 작업 중")]
 x = 640 - (3 * 320 + 2 * 40) // 2
 for name, label in names:

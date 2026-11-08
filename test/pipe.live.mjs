@@ -121,11 +121,28 @@ try {
   assert.ok(ab("close").ok);
   await sleep(500);
   assert.equal((await aiTabs()).length, 1, "an engine that disconnects keeps its tab for when it comes back");
+  const attached = await inWorker("new Promise(resolve => chrome.debugger.getTargets(targets => resolve(targets.filter(t => t.attached && t.tabId).length)))");
+  assert.equal(attached, 0, "the debugger lets go when the engine leaves, so Chrome's debugging bar goes away");
+  const welcome = (await fetch(`http://127.0.0.1:${chromePort}/json/list`).then(r => r.json())).some(t => t.url.endsWith("/popup.html?welcome=1"));
+  assert.ok(welcome, "a fresh install opened the setup page");
   assert.equal((await control("/send", { tool: "close", args: { workspace: "live" } })).result?.closed?.length, 1);
   assert.deepEqual(await aiTabs(), [], "close closes the AI tab; nothing is left behind");
   assert.ok(ab("--cdp", cdp, "open", "https://example.org/?again").ok);
   assert.equal((await aiTabs()).length, 1, "the next task opens one background tab");
-  console.log("  PASS  close closes the AI tab; the next task opens one");
+  console.log("  PASS  an engine that leaves keeps its tab and lets go of the debugger; close closes it; the next task opens one");
+
+  // The person closes the AI's tab mid-task: agent-browser would quietly open a new one, so the
+  // extension refuses until the AI has asked (and finished with close).
+  await inWorker("chrome.storage.session.get('v8TabWorkspaces').then(s => chrome.tabs.query({}).then(tabs => chrome.tabs.remove(tabs.filter(t => s.v8TabWorkspaces?.[t.id]).map(t => t.id))))");
+  await sleep(800);
+  const reopened = ab("open", "https://example.org/?reopen");
+  assert.ok(!reopened.ok && /No active page/.test(reopened.out), `agent-browser has no page left: ${reopened.out.slice(0, 200)}`);
+  const newTab = ab("tab", "new", "https://example.org/?reopen");
+  assert.ok(!newTab.ok && /the person closed the AI's tab/.test(newTab.out), `no new tab until the AI asked: ${newTab.out.slice(0, 200)}`);
+  assert.deepEqual(await aiTabs(), [], "nothing reopened behind the person's back");
+  assert.ok((await control("/send", { tool: "close", args: { workspace: "live" } })).result, "pc-browser close (the AI asked and goes on)");
+  assert.ok(ab("open", "https://example.org/?again").ok, "after close the engine may open a tab again");
+  console.log("  PASS  when the person closes the AI's tab, no tab reopens until the AI asks and closes");
 
   // No tab group at all (owner 11-08: Chrome keeps every group in its saved-groups bar), and a second
   // work space sees only its own tab.

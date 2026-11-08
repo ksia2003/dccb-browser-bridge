@@ -7,6 +7,10 @@
  * which work space is kept for this browser session; a tab nobody opened for the AI is the
  * person's and is never offered to an engine. The person brings an AI tab forward only from the
  * popup's card.
+ *
+ * Nothing disappears on its own (owner 11-08): an AI tab closes only when the AI says it is done,
+ * and not even then once the person has looked at it — then it is theirs. AI tabs are muted until
+ * the person looks at them (a video the AI opens must not play out of a tab nobody sees).
  */
 
 
@@ -44,9 +48,89 @@ export async function ownerOf(tabId: number): Promise<string | null> {
   return (await loadOwners())[tabId] ?? null;
 }
 
-/** The person took this AI tab (it was in front when the AI let go): it is theirs from now on. */
-export function releaseTab(tabId: number): Promise<void> {
-  return setOwner(tabId, null);
+/** The person took this AI tab: it is theirs from now on. */
+export async function releaseTab(tabId: number): Promise<void> {
+  await setOwner(tabId, null);
+  await setSeen(tabId, false);
+}
+
+/**
+ * Work spaces whose last AI tab the person closed. The AI may not open another until it has asked
+ * (owner 11-08); `close` (the AI finishing) clears it. Tabs the bridge closes itself are expected.
+ */
+const PERSON_CLOSED_KEY = "v8PersonClosedWorkspaces";
+const expectedRemovals = new Set<number>();
+/** Close AI tabs on the AI's behalf (the engine's tab close, `close`): not the person closing them. */
+export async function removeAiTabs(tabIds: number[]): Promise<void> {
+  for (const id of tabIds) expectedRemovals.add(id);
+  try { await chrome.tabs.remove(tabIds); }
+  finally { for (const id of tabIds) setTimeout(() => expectedRemovals.delete(id), 5_000); }
+}
+async function personClosed(): Promise<Set<string>> {
+  return new Set(((await chrome.storage.session.get(PERSON_CLOSED_KEY))[PERSON_CLOSED_KEY] as string[] | undefined) ?? []);
+}
+/** Did the person close this work space's last AI tab (and the AI has not finished since)? */
+export async function closedByPerson(workspace: unknown): Promise<boolean> {
+  return (await personClosed()).has(normalizeWorkspace(workspace));
+}
+export async function setClosedByPerson(workspace: unknown, value: boolean): Promise<void> {
+  const current = await personClosed();
+  const name = normalizeWorkspace(workspace);
+  if (current.has(name) === value) return;
+  if (value) current.add(name); else current.delete(name);
+  await chrome.storage.session.set({ [PERSON_CLOSED_KEY]: [...current] });
+}
+async function noticeRemoval(tabId: number): Promise<void> {
+  const workspace = await ownerOf(tabId);
+  if (workspace === null) return;
+  await setOwner(tabId, null);
+  if (expectedRemovals.delete(tabId)) return;
+  if ((await listDccbTabs(workspace)).length === 0) {
+    await setClosedByPerson(workspace, true);
+    log("the person closed the work space's last AI tab", { workspace });
+  }
+}
+
+/** AI tabs the person has looked at (kept for this browser session). */
+const SEEN_KEY = "v8SeenAiTabs";
+let seen: Set<number> | null = null;
+async function loadSeen(): Promise<Set<number>> {
+  seen ??= new Set(((await chrome.storage.session.get(SEEN_KEY))[SEEN_KEY] as number[] | undefined) ?? []);
+  return seen;
+}
+async function setSeen(tabId: number, value: boolean): Promise<void> {
+  const current = await loadSeen();
+  if (current.has(tabId) === value) return;
+  if (value) current.add(tabId); else current.delete(tabId);
+  await chrome.storage.session.set({ [SEEN_KEY]: [...current] });
+}
+/** Has the person looked at this AI tab? */
+export async function wasSeen(tabId: number): Promise<boolean> {
+  return (await loadSeen()).has(tabId);
+}
+
+/**
+ * A tab counts as looked at when it stays in front for a moment: Chrome brings a page an AI tab
+ * opens (target=_blank) forward for an instant before the adopter puts it back, which is not the
+ * person looking. Looking also turns its sound on.
+ */
+const SEEN_AFTER_MS = 1_500;
+export function installSeenWatch(): void {
+  // Also: an AI tab closing leaves its work space, and the person closing the last one is noticed.
+  chrome.tabs.onActivated.addListener(({ tabId }) => {
+    setTimeout(() => void (async () => {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (!tab?.active || await ownerOf(tabId) === null) return;
+      await setSeen(tabId, true);
+      if (tab.mutedInfo?.muted) await chrome.tabs.update(tabId, { muted: false }).catch(() => undefined);
+    })(), SEEN_AFTER_MS);
+  });
+  chrome.tabs.onRemoved.addListener(tabId => void setSeen(tabId, false).then(() => noticeRemoval(tabId)));
+}
+
+/** Mute a new AI tab: nobody is looking at it. */
+async function muteAiTab(tabId: number): Promise<void> {
+  await chrome.tabs.update(tabId, { muted: true }).catch(error => log("mute failed", String(error)));
 }
 
 /** Every open tab the AI opened, with its work space. */
@@ -92,6 +176,7 @@ async function createClientTab(url: string | undefined, workspace: string): Prom
     tab = created.tabs![0];
   }
   await setOwner(tab.id!, workspace);
+  await muteAiTab(tab.id!);
   setTargetTab(tab.id!, workspace);
   return tab;
 }
@@ -248,7 +333,6 @@ export function installNewTabAdopter(): void {
     });
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
-    void setOwner(tabId, null);
     createdTargetCandidates.delete(tabId);
     for (const [windowId, activeTabId] of lastActiveTabByWindow) {
       if (activeTabId === tabId) lastActiveTabByWindow.delete(windowId);
@@ -361,6 +445,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       await chrome.tabs.move(tabId, { windowId: source.windowId, index: -1 });
     }
     await setOwner(tabId, workspace);
+    await muteAiTab(tabId);
     await restoreChildSelection(tabId, details.sourceTabId, source.windowId, restoreCandidate, activationMark);
     await restoreChildWindowFocus(originalWindowId, source.windowId, restoreCandidate, focusedBeforeMove, focusMark);
     log("adopted target created by controlled page", {

@@ -12,7 +12,7 @@ DCCB Browser Bridge는 **사용자가 직접 운영하는 DCCB 서버(HOME)** �
 - **AI가 연 탭의 웹페이지 내용**: AI가 요청할 때, AI가 직접 연 탭의 페이지 구조, 텍스트, 스크린샷, 네트워크 요청을 `chrome.debugger`로 읽어 사용자의 서버로 보냅니다. 사람이 쓰는 탭은 읽지 않습니다.
 - **로그인 쿠키를 쓰는 요청(fetch)**: AI가 요청하면 확장이 Chrome의 네트워크로 주소를 가져와 응답을 사용자의 서버로 보냅니다. 이때 그 사이트의 쿠키가 함께 갈 수 있습니다. 쿠키 값 자체를 읽거나 따로 보내지는 않습니다.
 - **연결 정보**: 서버 주소, 등록 토큰, 브라우저 식별자(무작위), 기기 이름, 마지막 연결 시각, 켜짐/꺼짐 같은 설정을 이 Chrome의 확장 저장소(`chrome.storage`)에 둡니다.
-- **AI 탭 표시**: 어느 탭이 AI가 연 것인지를 이 Chrome 세션 동안만 기억합니다(크롬을 다시 켜면 사라짐).
+- **AI 탭 표시**: 어느 탭이 AI가 연 것인지, 사람이 그 탭을 봤는지를 이 Chrome 세션 동안만 기억합니다(크롬을 다시 켜면 사라짐).
 
 ### 하지 않는 것
 - 광고, 분석, 추적 도구를 쓰지 않습니다.
@@ -41,7 +41,7 @@ DCCB Browser Bridge lets the AI on **a DCCB server (HOME) that you run yourself*
 - **Web page content of tabs the AI opened**: when the AI asks, the extension reads the page structure, text, screenshots and network requests of the tabs the AI itself opened, through `chrome.debugger`, and sends them to your server. It does not read the tabs you use.
 - **Requests with your login cookies (fetch)**: when the AI asks, the extension fetches a URL through Chrome's network and sends the response to your server. The site's cookies may be sent with that request. The extension does not read or forward cookie values themselves.
 - **Connection data**: the server address, enrollment tokens, a random browser identifier, the device name, the last connection time and on/off settings are kept in this Chrome's extension storage (`chrome.storage`).
-- **Which tabs are the AI's**: remembered only for the current Chrome session (gone when Chrome restarts).
+- **Which tabs are the AI's**, and whether you have looked at them: remembered only for the current Chrome session (gone when Chrome restarts).
 
 ### What it does not do
 - It uses no advertising, analytics or tracking.

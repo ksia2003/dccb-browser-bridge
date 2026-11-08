@@ -15,8 +15,8 @@ import type { BridgeMessage } from "../shared/protocol";
 import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
-import { closeAllPipes, closeIdleAiTabs, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, LAST_WORKSPACE_KEY, migrateFromTabGroups, popupTarget, setLastWorkspace } from "./lib/target";
+import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, popupTarget, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import "./lib/tools"; // side-effect: registers the tools into the registry
 
@@ -28,8 +28,7 @@ const BACKOFF_MAX_MS = 30_000;
 // fire onAlarm. The in-SW reconnect timer + keepalive interval both DIE when
 // Chrome kills the idle SW (30s idle / 5min cap), so on their own the bridge
 // could stay DARK after a termination until some unrelated event woke the SW.
-// This alarm is the only reconnect trigger that outlives the SW, and it also
-// closes AI tabs no engine came back to (lib/pipe.ts closeIdleAiTabs).
+// This alarm is the only reconnect trigger that outlives the SW.
 const RECONNECT_ALARM = "bb-reconnect";
 const RECONNECT_ALARM_PERIOD_MIN = 1;
 
@@ -59,7 +58,6 @@ function installReconnectAlarm(): void {
   });
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== RECONNECT_ALARM) return;
-    void closeIdleAiTabs().then(closed => { if (closed.length) pushSnapshot(); });
     // The alarm fired — the SW is awake now. If the bridge should be connected
     // but the socket died (typically alongside a prior SW termination), bring
     // it back. backoff is reset so the wake reconnects promptly.
@@ -270,11 +268,11 @@ interface PopupRequest {
   name?: string;
 }
 
-/** What the popup draws: connection state, and the page the AI is on while an engine is connected. */
+/** What the popup draws: connection state, and the AI's page (the one it is on, or left open). */
 async function popupSnapshot() {
   const snap = auth.snapshot();
   const working = pipeChannelCount() > 0;
-  const tab = working ? await popupTarget() : null;
+  const tab = await popupTarget();
   return {
     state: snap.state,
     error: snap.error,
@@ -348,12 +346,18 @@ export default defineBackground(() => {
   // Pages a controlled tab opens (target=_blank, window.open) join its work space, confirmed by
   // webNavigation's sourceTabId; Chrome's own focus change for them is undone.
   installNewTabAdopter();
+  installSeenWatch();
   installPipe(
     frame => send(frame),
     () => pushSnapshot(),
     () => auth.isEnabled() ? null : "Browser Bridge is not connected",
   );
   installPopupBridge();
+  // A fresh install opens the setup page once: Chrome hides a new extension's icon in the puzzle
+  // menu, so the popup alone would leave the person looking for it.
+  chrome.runtime.onInstalled.addListener(details => {
+    if (details.reason === "install") void chrome.tabs.create({ url: chrome.runtime.getURL("/popup.html?welcome=1") });
+  });
   // Once, on the first start of 6.0.0 (guarded by a stored flag): leave 1.2.x's tab group behind.
   void migrateFromTabGroups().catch(error => log("migration failed", String(error)));
 

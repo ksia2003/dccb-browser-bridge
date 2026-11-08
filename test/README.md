@@ -5,8 +5,10 @@
     `ws-origin`, `v8-profile`, `relay-release`: enrollment, the public door, loopback account checks
   - `target.unit.test.mjs`: the AI's tabs — ownership, background tabs with no group, adopting tabs
     a controlled page opens, the popup card's tab, leaving 1.2.x's tab group behind
-  - `idle-close.unit.mjs`: a work space's tabs close when its engine leaves, or 10 minutes after a
-    dropped relay socket
+  - `tab-lifecycle.unit.mjs`: nothing closes on its own; `close` closes only tabs the person never
+    looked at; AI tabs are muted until looked at; the debugger lets go when the engine leaves
+  - `pairing.unit.mjs`: the address and the code from one paste
+  - `duplicate-browsers.integration.mjs`: an old unpacked copy next to the Web Store copy
   - `cdp-lifecycle.unit.mjs`: attach with focus emulation, detach clean-up
   - `fetch-tool.unit.mjs`: the extension's `fetch`
   - `pipe.unit.mjs`: the relay's CDP endpoint and session with a fake extension and engine

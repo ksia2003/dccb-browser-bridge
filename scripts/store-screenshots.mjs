@@ -97,6 +97,21 @@ try {
     await fetch(`http://127.0.0.1:${chromePort}/json/close/${page.id}`);
   };
 
+  // ⓪ The setup page a fresh install opens (--load-extension counts as an install).
+  let welcomePage;
+  for (let i = 0; i < 25 && !welcomePage; i++) {
+    welcomePage = (await list()).find(t => t.url.endsWith("/popup.html?welcome=1"));
+    if (!welcomePage) await sleep(200);
+  }
+  if (welcomePage) {
+    const session = await connect(welcomePage.webSocketDebuggerUrl);
+    await session.call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
+    await sleep(800);
+    const shot = await session.call("Page.captureScreenshot", { format: "png" });
+    writeFileSync(join(outDir, "welcome.png"), Buffer.from(shot.data, "base64"));
+    session.close();
+    await fetch(`http://127.0.0.1:${chromePort}/json/close/${welcomePage.id}`);
+  }
   // ① Before enrollment.
   await popupShot("setup");
   // Enroll through the popup page and name the device.

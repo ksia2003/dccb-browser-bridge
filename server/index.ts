@@ -29,7 +29,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { loopbackPeerUid, trustedLocalUids } from "./peer-uid.js";
 import type { Duplex } from "node:stream";
 import type { BridgeMessage, EnrollRedeemResponse, ToolRequest, ToolResponse } from "../shared/protocol.js";
-import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol.js";
+import { compareExtensionVersions, isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol.js";
 import {
   loadTokensFromDisk,
   startAuthSweep,
@@ -98,6 +98,8 @@ interface ConnectedBrowser {
   version: string | null;
 }
 const browsers = new Map<string, ConnectedBrowser>();
+/** The first Browser Bridge from the Chrome Web Store; older copies were unpacked from a ZIP. */
+const STORE_EXTENSION_VERSION = "6.0.0";
 let cachedReleaseVersion: { path: string; size: number; mtimeMs: number; version: string | null } | undefined;
 let lastAnnouncedReleaseVersion: string | null | undefined;
 
@@ -518,6 +520,12 @@ function resolveTarget(target?: string): ConnectedBrowser {
   }
   if (open.length === 1) {
     return open[0];
+  }
+  // Someone who installs the Web Store copy (6.0.0) and keeps the old unpacked one connects twice
+  // from one Chrome. The only current copy among outdated ones is the one to use (owner 11-08).
+  const current = open.filter((b) => isExtensionVersion(b.version) && compareExtensionVersions(b.version, STORE_EXTENSION_VERSION) >= 0);
+  if (current.length === 1) {
+    return current[0];
   }
   throw new ToolDispatchError(
     `multiple browsers connected; specify a "target" browserId`,

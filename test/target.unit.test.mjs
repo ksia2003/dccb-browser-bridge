@@ -176,6 +176,7 @@ const {
   focusPopupTarget,
   migrateFromTabGroups,
   setTargetTab,
+  installSeenWatch,
 } = await import("../entrypoints/lib/target.ts");
 
 let passed = 0;
@@ -194,6 +195,7 @@ function check(name, condition, detail = "") {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 installNewTabAdopter();
+installSeenWatch();
 await tick();
 
 check(
