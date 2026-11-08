@@ -168,7 +168,10 @@ function scheduleRefresh(): void {
 export async function init(nextHooks: AuthHooks): Promise<void> {
   hooks = nextHooks;
   const stored = await chrome.storage.local.get([PROFILE_KEY, ENABLED_KEY, NAME_KEY, LAST_CONNECTED_KEY]) as Record<string, unknown>;
-  enabled = stored[ENABLED_KEY] !== false;
+  // 6.0.0 has no on/off switch (a person turns the extension off in chrome://extensions); a Chrome
+  // switched off in an older version comes back on.
+  enabled = true;
+  if (stored[ENABLED_KEY] === false) await chrome.storage.local.remove(ENABLED_KEY);
   deviceName = typeof stored[NAME_KEY] === "string" && stored[NAME_KEY].trim() ? String(stored[NAME_KEY]).slice(0, 40) : defaultDeviceName();
   lastConnectedAt = typeof stored[LAST_CONNECTED_KEY] === "number" ? stored[LAST_CONNECTED_KEY] : null;
   if (!validProfile(stored.v8BrowserBridgeProfile)) {
@@ -246,13 +249,6 @@ export async function setup(address: string, setupCode: string): Promise<void> {
 }
 
 export async function reset(): Promise<void> { await clearProfile(null); }
-export async function setEnabled(value: boolean): Promise<void> {
-  enabled = value;
-  await chrome.storage.local.set({ [ENABLED_KEY]: value });
-  if (!value) { clearRefreshTimer(); nextRetryAt = null; hooks?.closeSocket(); setState(profile ? "off" : "setup"); }
-  else if (profile) { scheduleRefresh(); setState("connecting"); hooks?.openSocket(); }
-  else setState("setup");
-}
 export async function setDeviceName(raw: string): Promise<void> {
   const name = raw.trim().slice(0, 40);
   if (!name) return;

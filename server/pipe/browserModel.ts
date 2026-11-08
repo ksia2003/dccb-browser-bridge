@@ -19,7 +19,8 @@
 // Modified by DCCB (2026-11-06): Target.setDiscoverTargets / getTargets / attachToTarget for
 // Puppeteer-style clients such as agent-browser (`enableDiscover`, `getTargets`, `attachToTarget`,
 // targetCreated/targetDestroyed instead of attachedToTarget in discover mode). Focus emulation is
-// set by the extension when it attaches (entrypoints/lib/cdp.ts), not here.
+// set by the extension when it attaches (entrypoints/lib/cdp.ts), not here. Browser.close closes only the tabs
+// the work space was given (`closeOwnTabs`, 2026-11-08).
 
 /**
  * Browser-side tab model used by the v2 relay. Owns the mapping between
@@ -179,6 +180,13 @@ export class BrowserModel {
       return { success: false };
     await this._sendToExtension('chrome.tabs.remove', [tabSession.tabId]);
     return { success: true };
+  }
+
+  /** Browser.close from the engine: close the tabs this work space was given, not the browser. */
+  async closeOwnTabs(): Promise<void> {
+    const ids = [...this._knownTabs.keys()];
+    if (ids.length)
+      await this._sendToExtension('chrome.tabs.remove', [ids]);
   }
 
   getTargetInfo(sessionId: string | undefined): any {

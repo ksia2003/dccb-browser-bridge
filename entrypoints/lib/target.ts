@@ -1,18 +1,15 @@
 /**
- * DCCB Browser Bridge — the AI's tabs: ONE "AI · <device>" tab group per connected Chrome, the
- * idle tab that keeps it alive, and the optional dedicated AI window. Work spaces share the group;
- * which tab belongs to which work space is kept per browser session (owner 11-08: four AI groups
- * left in Chrome's saved-groups bar is not acceptable — Chrome pins every group there).
+ * DCCB Browser Bridge — the AI's tabs (6.0.0, owner 11-08).
  *
- * The pipe (lib/pipe.ts) offers an engine only its work space's tabs and opens a tab only when
- * there is none (owner 11-06: never a new tab per connection). The bridge never drives the person's
- * own tabs; the popup's "AI 작업 탭 보기" and `handoff` bring the AI tab forward.
+ * The AI works in ordinary tabs it opened itself: background tabs at the end of a normal window,
+ * never brought forward and never grouped (Chrome files every tab group in its saved-groups bar and
+ * keeps it there after the window closes; nothing an extension can remove). Which tab belongs to
+ * which work space is kept for this browser session; a tab nobody opened for the AI is the
+ * person's and is never offered to an engine. The person brings an AI tab forward only from the
+ * popup's card.
  */
 
-import { snapshot, connectionKey as clientKey } from "./v8-auth";
 
-const GROUPS_KEY = "v8ClientGroups";
-export const DEDICATED_WINDOW_KEY = "v8DedicatedWindow";
 export const LAST_WORKSPACE_KEY = "v8LastWorkspace";
 const DEFAULT_WORKSPACE = "default";
 const currentTargets = new Map<string, number | null>();
@@ -24,10 +21,7 @@ export function normalizeWorkspace(value?: unknown): string {
   throw new Error("workspace는 1~40자 [A-Za-z0-9_-]");
 }
 
-/**
- * Tab → work space, for this browser session (tab ids do not outlive it). A tab of the group with
- * no owner (after a Chrome restart) belongs to the default work space.
- */
+/** Tab → work space, for this browser session (tab ids do not outlive it). */
 const OWNERS_KEY = "v8TabWorkspaces";
 let owners: Record<string, string> | null = null;
 let ownerQueue: Promise<void> = Promise.resolve();
@@ -45,149 +39,69 @@ function setOwner(tabId: number, workspace: string | null): Promise<void> {
   ownerQueue = task.catch(() => {});
   return task;
 }
-/** The idle tab belongs to no work space. */
-export function forgetTabOwner(tabId: number): Promise<void> {
-  return setOwner(tabId, null);
-}
-async function ownerOf(tabId: number): Promise<string> {
-  return (await loadOwners())[tabId] ?? DEFAULT_WORKSPACE;
+/** The work space a tab was opened for, or null for the person's own tabs. */
+export async function ownerOf(tabId: number): Promise<string | null> {
+  return (await loadOwners())[tabId] ?? null;
 }
 
-let workspaceStorageQueue: Promise<void> = Promise.resolve();
-function storeWorkspaceEntry(key: string, entryKey: string, value: number): Promise<void> {
-  const task = workspaceStorageQueue.then(async () => {
-    const stored = await chrome.storage.local.get(key);
-    await chrome.storage.local.set({ [key]: { ...stored[key], [entryKey]: value } });
-  });
-  workspaceStorageQueue = task.catch(() => {});
-  return task;
+/** Every open tab the AI opened, with its work space. */
+export async function listAiTabs(): Promise<{ tab: chrome.tabs.Tab; workspace: string }[]> {
+  const current = await loadOwners();
+  const tabs = await chrome.tabs.query({});
+  return tabs.flatMap(tab => tab.id !== undefined && current[tab.id] ? [{ tab, workspace: current[tab.id] }] : []);
 }
 
-/**
- * The tab the AI group keeps when its last working tab is closed. Chrome closes
- * a group with its last tab and files it under Saved Tab Groups, where no
- * extension API can reopen it; the next tab then got a second group of the same
- * name, every time (seen 2026-11-04: three closed "AI · Windows의 Chrome").
- * Chrome closes this page when the extension reloads or updates, and the group
- * with it, but that group is not saved: the next connection makes one new group
- * (owner PC 11-07). about:blank opened by the extension or its debugger closes
- * the same way, so the page that explains itself stays.
- */
-export const idleUrl = (): string => chrome.runtime.getURL("/idle.html");
-
-export function groupTitle(): string {
-  return "AI · " + snapshot().deviceName;
+/** The work space's tabs. */
+export async function listDccbTabs(workspace?: unknown): Promise<chrome.tabs.Tab[]> {
+  const workspaceName = normalizeWorkspace(workspace);
+  return (await listAiTabs()).filter(entry => entry.workspace === workspaceName).map(entry => entry.tab);
 }
 
-async function clientGroup(): Promise<number | null> {
-  const stored = await chrome.storage.local.get(GROUPS_KEY);
-  const id = stored[GROUPS_KEY]?.[clientKey()];
-  let found = typeof id === "number" && await chrome.tabGroups.get(id).catch(() => null) ? id : null;
-  if (found === null) {
-    // Group ids change when Chrome restarts and when this connection is paired
-    // again, so an open group with this connection's title is the same group.
-    const [named] = await chrome.tabGroups.query({ title: groupTitle() });
-    // No group of that name but a 1.2.0 work space group: rename it into the one group rather than
-    // open another (an emptied or closed group is what piles up in Chrome's saved-groups bar).
-    const legacy = named ? undefined : (await chrome.tabGroups.query({})).find(group => group.title?.startsWith(groupTitle() + " · "));
-    if (legacy) {
-      const workspace = legacy.title!.slice(groupTitle().length + 3);
-      for (const tab of await chrome.tabs.query({ groupId: legacy.id })) if (tab.id !== undefined) await setOwner(tab.id, tab.url === idleUrl() ? null : workspace);
-      await chrome.tabGroups.update(legacy.id, { title: groupTitle() });
-      log("renamed a work space group into the AI group", { workspace });
-    }
-    const adopted = named ?? legacy;
-    if (adopted) {
-      found = adopted.id;
-      await storeWorkspaceEntry(GROUPS_KEY, clientKey(), adopted.id);
-    }
-  }
-  if (found !== null) await mergeWorkspaceGroups(found);
-  return found;
+/** Is `tabId` one the AI opened for this work space? */
+export async function isControlledTab(tabId: number, workspace?: unknown): Promise<boolean> {
+  return await ownerOf(tabId) === normalizeWorkspace(workspace)
+    && Boolean(await chrome.tabs.get(tabId).catch(() => undefined));
 }
 
 /**
- * Before 1.2.1 each work space had its own "AI · <device> · <work space>" group. Fold any that are
- * still open into the one group, keeping each tab's work space and a single idle tab.
+ * Open a background tab for the work space: next to its other tabs if it has any, else at the end
+ * of the last focused normal window. One queue, so two engines never race for a window.
  */
-async function mergeWorkspaceGroups(main: number): Promise<void> {
-  const prefix = groupTitle() + " · ";
-  for (const group of await chrome.tabGroups.query({})) {
-    if (group.id === main || !group.title?.startsWith(prefix)) continue;
-    const workspace = group.title.slice(prefix.length);
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    for (const tab of tabs) if (tab.id !== undefined) await setOwner(tab.id, tab.url === idleUrl() ? null : workspace);
-    const ids = tabs.map(tab => tab.id).filter((id): id is number => id !== undefined);
-    if (ids.length) await chrome.tabs.group({ tabIds: ids, groupId: main });
-    log("merged work space group into the AI group", { workspace, tabs: ids.length });
-  }
-  // Merging can bring several idle tabs; one is enough (the next AI tab reuses it).
-  const extra = (await chrome.tabs.query({ groupId: main })).filter(tab => tab.url === idleUrl()).slice(1);
-  if (extra.length) await chrome.tabs.remove(extra.map(tab => tab.id!));
-}
-const creationQueues = new Map<string, Promise<unknown>>();
+let creationQueue: Promise<unknown> = Promise.resolve();
 export function createControlledTab(url?: string, workspace?: unknown): Promise<chrome.tabs.Tab> {
   const workspaceName = normalizeWorkspace(workspace);
-  // One queue for the one group: two work spaces must not both claim the idle tab.
-  const task = (creationQueues.get("") ?? Promise.resolve()).then(() => createClientTab(url, workspaceName));
-  creationQueues.set("", task.catch(() => {}));
+  const task = creationQueue.then(() => createClientTab(url, workspaceName));
+  creationQueue = task.catch(() => {});
   return task;
 }
-async function createClientTab(url?: string, workspace = DEFAULT_WORKSPACE): Promise<chrome.tabs.Tab> {
-  workspace = normalizeWorkspace(workspace);
-  const stored = await chrome.storage.local.get(DEDICATED_WINDOW_KEY);
-  const group = await clientGroup();
-  const windowId = group === null ? undefined : (await chrome.tabGroups.get(group)).windowId;
+async function createClientTab(url: string | undefined, workspace: string): Promise<chrome.tabs.Tab> {
+  const sibling = (await listDccbTabs(workspace))[0];
+  const window = sibling ? undefined : await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => undefined);
+  const windowId = sibling?.windowId ?? (window?.type === "normal" ? window.id : undefined);
   let tab: chrome.tabs.Tab;
-  const windows = await chrome.storage.local.get("v8ClientWindows");
-  const dedicatedId = windows.v8ClientWindows?.[clientKey()];
-  const dedicated = typeof dedicatedId === "number" ? await chrome.windows.get(dedicatedId).catch(() => null) : null;
-  // Match patterns cannot name an extension page, so filter by URL here.
-  const idle = group === null ? undefined : (await chrome.tabs.query({ groupId: group })).find(t => t.url === idleUrl());
-  if (idle?.id !== undefined) {
-    tab = await chrome.tabs.update(idle.id, { url: url ?? "about:blank" }) ?? idle;
-  } else if (stored[DEDICATED_WINDOW_KEY] === true && dedicated && windowId === undefined) {
-    // The group is gone (an extension reload closes its idle tab) but the AI window is still open:
-    // reuse it instead of opening one more window per reload (owner PC 11-07: two AI windows).
-    tab = await chrome.tabs.create({ active: false, windowId: dedicated.id, url: url ?? "about:blank" });
-  } else if (stored[DEDICATED_WINDOW_KEY] === true && (!dedicated || windowId === undefined || windowId !== dedicated.id)) {
-    const window = await chrome.windows.create({ focused: false, url: url ?? "about:blank" });
-    tab = window.tabs![0];
-    if (group !== null) await chrome.tabGroups.move(group, { windowId: window.id!, index: -1 });
-    await storeWorkspaceEntry("v8ClientWindows", clientKey(), window.id!);
+  if (windowId !== undefined) {
+    tab = await chrome.tabs.create({ active: false, windowId, ...(url ? { url } : {}) });
   } else {
-    tab = await chrome.tabs.create({ active: false, ...(url ? { url } : {}), ...(windowId !== undefined ? { windowId } : {}) });
+    // No browser window is open (Chrome running in the background): open one without taking focus.
+    const created = await chrome.windows.create({ focused: false, ...(url ? { url } : {}) });
+    tab = created.tabs![0];
   }
-  await addToDccbGroup(tab.id!, workspace);
+  await setOwner(tab.id!, workspace);
   setTargetTab(tab.id!, workspace);
   return tab;
 }
 
-export async function focusControlledTab(explicitTabId?: unknown, workspace?: unknown) {
-  const workspaceName = normalizeWorkspace(workspace);
-  const tabId = await resolveTabId(explicitTabId, workspaceName);
-  const [previous] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const tab = await chrome.tabs.get(tabId);
-  const window = await chrome.windows.get(tab.windowId);
-  await chrome.windows.update(tab.windowId, { focused: true, ...(window.state === "minimized" ? { state: "normal" as const } : {}) });
-  await chrome.tabs.update(tabId, { active: true });
-  setTargetTab(tabId, workspaceName);
-  return { action: "focus", tabId, previousActiveTabId: previous?.id ?? null, ok: true };
+/** The AI tab the popup shows: the last work space's working tab, else any AI tab. */
+export async function popupTarget(): Promise<chrome.tabs.Tab | null> {
+  const workspace = getLastWorkspace();
+  const tabs = await listDccbTabs(workspace);
+  const working = getTargetTab(workspace);
+  return tabs.find(tab => tab.id === working) ?? tabs[0] ?? (await listAiTabs())[0]?.tab ?? null;
 }
 
-/**
- * The popup's "작업 탭으로 이동": the last work space's tab, else any tab of the
- * AI group (the idle tab last). False when there is no AI group yet.
- */
-export async function focusAnyGroupTab(workspace?: unknown): Promise<boolean> {
-  try {
-    await focusControlledTab(undefined, workspace);
-    return true;
-  } catch (error) {
-    log("focus fell back to the group:", error instanceof Error ? error.message : String(error));
-  }
-  const tabs = await listGroupTabs();
-  const tab = tabs.find(t => t.url !== idleUrl()) ?? tabs[0];
+/** The popup's card: bring that AI tab forward (the person asked). */
+export async function focusPopupTarget(): Promise<boolean> {
+  const tab = await popupTarget();
   if (tab?.id === undefined) return false;
   const window = await chrome.windows.get(tab.windowId);
   await chrome.windows.update(tab.windowId, { focused: true, ...(window.state === "minimized" ? { state: "normal" as const } : {}) });
@@ -195,29 +109,41 @@ export async function focusAnyGroupTab(workspace?: unknown): Promise<boolean> {
   return true;
 }
 
-
-function log(...args: unknown[]): void {
-  console.log("[bb-v6 target]", ...args);
+/**
+ * Before 6.0.0 the AI's tabs sat in an "AI · <device>" tab group kept alive by an idle tab. On the
+ * first run of 6.0.0, close the idle tabs and ungroup what is left of those groups, so nothing new
+ * reaches Chrome's saved-groups bar. Labels Chrome already saved there stay (no API removes them).
+ */
+const MIGRATED_KEY = "v8Migrated600";
+const RETIRED_KEYS = ["v8ClientGroups", "v8ClientWindows", "v8DedicatedWindow", "v8BrowserBridgeHandoff", "v8BrowserBridgeHandoffMessage", "v8BrowserBridgeActivity"];
+export async function migrateFromTabGroups(): Promise<void> {
+  const stored = await chrome.storage.local.get([MIGRATED_KEY, "v8ClientGroups"]);
+  if (stored[MIGRATED_KEY] === true) return;
+  const idlePage = chrome.runtime.getURL("/idle.html");
+  const tabs = await chrome.tabs.query({});
+  const groups = new Set<number>(Object.values((stored.v8ClientGroups ?? {}) as Record<string, unknown>).filter((id): id is number => typeof id === "number"));
+  for (const tab of tabs) if (tab.url === idlePage && tab.groupId !== undefined && tab.groupId >= 0) groups.add(tab.groupId);
+  const idle = tabs.filter(tab => tab.url === idlePage).map(tab => tab.id!).filter(id => id !== undefined);
+  const grouped = tabs.filter(tab => tab.id !== undefined && tab.groupId !== undefined && groups.has(tab.groupId) && !idle.includes(tab.id)).map(tab => tab.id!);
+  if (grouped.length) await chrome.tabs.ungroup(grouped).catch(error => log("ungroup failed", String(error)));
+  if (idle.length) await chrome.tabs.remove(idle).catch(error => log("idle tab close failed", String(error)));
+  await chrome.storage.local.remove(RETIRED_KEYS);
+  await chrome.storage.local.set({ [MIGRATED_KEY]: true });
+  log("left the tab group behind", { ungrouped: grouped.length, idleClosed: idle.length });
 }
 
-/**
- * The bridge's dedicated working tab. Set when the AI creates a tab
- * (`tabs` create) or navigates (`navigate`); cleared when that tab is closed
- * (tabs.onRemoved) or the debugger detaches from it. Tools target THIS tab —
- * never the user's active/focused tab.
- */
-/** Set the bridge's working tab (called by navigate / tabs-create). */
+function log(...args: unknown[]): void {
+  console.log("[bb target]", ...args);
+}
+
+/** Set the work space's working tab. */
 export function setTargetTab(tabId: number, workspace?: unknown): void {
   const workspaceName = normalizeWorkspace(workspace);
-  const currentTargetTabId = currentTargets.get(workspaceName) ?? null;
-  if (currentTargetTabId !== tabId) {
-    log("currentTargetTabId:", workspaceName, currentTargetTabId, "->", tabId);
-  }
   currentTargets.set(workspaceName, tabId);
   setLastWorkspace(workspaceName);
 }
 
-/** The bridge's current working tab id, or null if none is set yet. */
+/** The work space's working tab id, or null if none is set yet. */
 export function getTargetTab(workspace?: unknown): number | null {
   return currentTargets.get(normalizeWorkspace(workspace)) ?? null;
 }
@@ -236,144 +162,8 @@ export function getLastWorkspace(): string {
 /** Clear the working tab if `tabId` matches it (called on tab-removed/detach). */
 export function clearTargetTabIfMatches(tabId: number, workspace?: unknown): void {
   for (const [key, currentTargetTabId] of currentTargets) {
-    if (currentTargetTabId === tabId && (workspace === undefined || key === normalizeWorkspace(workspace))) {
-      log("currentTargetTabId cleared (workspace", key, "tab", tabId, "gone)");
-      currentTargets.set(key, null);
-    }
+    if (currentTargetTabId === tabId && (workspace === undefined || key === normalizeWorkspace(workspace))) currentTargets.set(key, null);
   }
-}
-
-/** True if a tab still exists. */
-async function tabExists(tabId: number, workspace = DEFAULT_WORKSPACE): Promise<boolean> {
-  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-  return Boolean(tab && tab.id !== undefined && await isControlledTab(tabId, workspace));
-}
-
-/**
- * Resolve the tab a command applies to: an explicit `tabId` (it must be one of the group's), else
- * the working tab, else a tab of the group. Never the person's active tab.
- */
-export async function resolveTabId(explicitTabId?: unknown, workspace?: unknown): Promise<number> {
-  return resolveTabIdRaw(explicitTabId, normalizeWorkspace(workspace));
-}
-
-async function resolveTabIdRaw(explicitTabId: unknown, workspace: string): Promise<number> {
-  // (a) explicit tabId wins, but only for an already-controlled tab. A caller
-  // supplying an arbitrary personal tab must never turn it into a target.
-  if (typeof explicitTabId === "number") {
-    const tab = await chrome.tabs.get(explicitTabId).catch(() => undefined);
-    if (!tab || tab.id === undefined) {
-      throw new Error(`tabId ${explicitTabId} not found`);
-    }
-    if (!(await isControlledTab(explicitTabId, workspace))) {
-      throw new Error(`tabId ${explicitTabId} is not a bridge-controlled DCCB tab`);
-    }
-    return tab.id;
-  }
-
-  // (b) the bridge's dedicated working tab, if it still exists.
-  const currentTargetTabId = getTargetTab(workspace);
-  if (currentTargetTabId !== null) {
-    if (await tabExists(currentTargetTabId, workspace)) return currentTargetTabId;
-    // It was closed out from under us — forget it.
-    clearTargetTabIfMatches(currentTargetTabId, workspace);
-  }
-
-  // (c) any tab in the DCCB group (recovery after SW restart loses the cache).
-  const groupTab = await firstDccbTabId(workspace);
-  if (groupTab !== null) {
-    // Adopt it as the working tab so subsequent tools are stable.
-    setTargetTab(groupTab, workspace);
-    return groupTab;
-  }
-
-  // (d) NO active-tab fallback. The bridge must work in its OWN tab.
-  throw new Error("no AI tab in this work space yet — open one with pc-browser first");
-}
-
-/**
- * Add `tabId` to this connection’s AI group, creating it on first use.
- * Surface Chrome’s grouping error rather than claim an ungrouped tab is owned.
- */
-let groupQueue: Promise<void> = Promise.resolve();
-export function addToDccbGroup(tabId: number, workspace?: unknown): Promise<void> {
-  const workspaceName = normalizeWorkspace(workspace);
-  const task = groupQueue.then(() => addToClientGroup(tabId, workspaceName));
-  groupQueue = task.catch(() => {});
-  return task;
-}
-async function addToClientGroup(tabId: number, workspace: string): Promise<void> {
-  try {
-    const existing = await findDccbGroupId();
-    const groupId = await chrome.tabs.group(
-      existing !== null ? { tabIds: tabId, groupId: existing } : { tabIds: tabId },
-    );
-    await setOwner(tabId, workspace);
-    if (existing === null) {
-      await chrome.tabGroups.update(groupId, {
-        title: groupTitle(),
-        color: (["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"] as const)[Array.from(clientKey()).reduce((n, c) => n + c.charCodeAt(0), 0) % 8],
-        collapsed: false,
-      });
-      await storeWorkspaceEntry(GROUPS_KEY, clientKey(), groupId);
-      log("created client group", groupId);
-    }
-  } catch (e) {
-    log("group add failed:", e instanceof Error ? e.message : String(e));
-    throw e;
-  }
-}
-
-/** Find this connection’s AI group (one for every work space), or null. */
-export async function findDccbGroupId(): Promise<number | null> {
-  return clientGroup();
-}
-
-/** First tab of the group the debugger can drive (not the idle tab, not chrome:// pages), or null. */
-async function firstDccbTabId(workspace = DEFAULT_WORKSPACE): Promise<number | null> {
-  const tabs = await listDccbTabs(workspace);
-  for (const t of tabs) {
-    const url = (t.url ?? "").toLowerCase();
-    if (t.id !== undefined && !/^(chrome|chrome-extension|devtools|edge|view-source):/.test(url)) return t.id;
-  }
-  return null;
-}
-
-/** Every tab of the AI group, all work spaces and the idle tab (empty if there is no group yet). */
-export async function listGroupTabs(): Promise<chrome.tabs.Tab[]> {
-  const groupId = await findDccbGroupId();
-  if (groupId === null) return [];
-  return chrome.tabs.query({ groupId });
-}
-
-/** The work space's tabs in the AI group (not the idle tab). */
-export async function listDccbTabs(workspace?: unknown): Promise<chrome.tabs.Tab[]> {
-  const workspaceName = normalizeWorkspace(workspace);
-  const tabs: chrome.tabs.Tab[] = [];
-  for (const tab of await listGroupTabs()) {
-    if (tab.id !== undefined && tab.url !== idleUrl() && await ownerOf(tab.id) === workspaceName) tabs.push(tab);
-  }
-  return tabs;
-}
-
-/**
- * Is `tabId` a member of the connection’s AI group? The new-target adopter applies this to
- * webNavigation's actual `sourceTabId`; `openerTabId` and creation timing are
- * not ownership evidence.
- */
-export async function isControlledTab(tabId: number, workspace?: unknown): Promise<boolean> {
-  const workspaceName = normalizeWorkspace(workspace);
-  const groupId = await findDccbGroupId();
-  if (groupId === null) return false;
-  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-  return Boolean(tab && tab.groupId === groupId && await ownerOf(tabId) === workspaceName);
-}
-
-async function workspaceForTab(tabId: number): Promise<string | null> {
-  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-  const groupId = await findDccbGroupId();
-  if (!tab || groupId === null || tab.groupId !== groupId) return null;
-  return ownerOf(tabId);
 }
 
 let newTabAdopterInstalled = false;
@@ -525,7 +315,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
   handledNavigationTargets.add(tabId);
   const candidate = createdTargetCandidates.get(tabId);
   try {
-    const workspace = await workspaceForTab(details.sourceTabId);
+    const workspace = await ownerOf(details.sourceTabId);
     if (workspace === null) {
       log("ignored new target from uncontrolled source", {
         tabId, sourceTabId: details.sourceTabId, sourceFrameId: details.sourceFrameId,
@@ -565,7 +355,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       // the webNavigation event proves the controlled source created it.
       await chrome.tabs.move(tabId, { windowId: source.windowId, index: -1 });
     }
-    await addToDccbGroup(tabId, workspace);
+    await setOwner(tabId, workspace);
     await restoreChildSelection(tabId, details.sourceTabId, source.windowId, restoreCandidate, activationMark);
     await restoreChildWindowFocus(originalWindowId, source.windowId, restoreCandidate, focusedBeforeMove, focusMark);
     log("adopted target created by controlled page", {

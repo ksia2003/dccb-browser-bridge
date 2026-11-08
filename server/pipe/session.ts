@@ -21,9 +21,10 @@
 //   - the extension link is a channel on Browser Bridge's existing relay WebSocket (pipe_* frames),
 //     not a separate socket, so it rides the public door and the 1.0.9 account checks;
 //   - always "background" mode: Page.bringToFront / Target.activateTarget never raise the person's
-//     tab, Target.createTarget opens an inactive tab in the work space's group;
+//     tab, Target.createTarget opens an inactive tab for the work space;
 //   - Target discovery for Puppeteer-style clients (agent-browser);
-//   - Browser.close and browser-context commands never reach the person's Chrome.
+//   - Browser.close closes only the work space's own tabs; browser-context commands never reach the
+//     person's Chrome.
 
 import { BrowserModel, type CDPMessage } from "./browserModel.js";
 import type { ExtensionEventsV2 } from "./protocol.js";
@@ -150,8 +151,11 @@ export class PipeSession {
       case "Browser.getVersion":
         return { protocolVersion: "1.3", product: "Chrome/DCCB-Browser-Bridge", revision: "", userAgent: "DCCB-Browser-Bridge-pipe", jsVersion: "" };
       case "Browser.setDownloadBehavior":
+        // Downloads stay with Chrome's own settings.
+        return {};
       case "Browser.close":
-        // Downloads stay with Chrome's own settings; closing the engine must never close the person's Chrome.
+        // Closing the engine's browser closes only the tabs it opened, never the person's Chrome (6.0.0).
+        await this.model.closeOwnTabs();
         return {};
     }
     if (!sessionId && REFUSED_BROWSER_COMMANDS.has(method)) throw new Error(`${method} is not available on a person's Chrome`);

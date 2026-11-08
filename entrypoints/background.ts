@@ -1,31 +1,24 @@
 /**
- * DCCB Browser Bridge — MV3 service worker.
+ * DCCB Browser Bridge — MV3 service worker (6.0.0).
  *
- * Maintains a WebSocket to the HOME relay. Page work arrives as `pipe_*` frames: a thin
+ * Keeps a WebSocket to the person's DCCB HOME relay. Page work arrives as `pipe_*` frames: a thin
  * chrome.debugger channel that agent-browser on the HOME drives (`pc-browser`, lib/pipe.ts).
- * `tool_request` runs the extension's own few tools (fetch, handoff, notify, extension).
+ * `tool_request` runs the extension's own two tools (fetch, extension). Nothing here asks the
+ * person for anything: the AI talks to them in chat (owner 11-08), and the popup only shows state.
  *
- * Auth: the WebSocket is opened ONLY when `lib/auth` holds a usable bearer, and
- * the bearer is carried as the `bb-bearer.<token>` WebSocket subprotocol — the
- * browser WebSocket cannot set request headers, and we never use a `?token=`
- * query string. The auth state machine owns pairing/refresh/expiry; this module
- * owns the socket and reports lifecycle (open/close 4401) back to auth.
- *
- * The popup talks to this worker over chrome.runtime messaging:
- *   getState | enable | disable | newCode  →  always replies with an AuthSnapshot.
- * The worker also pushes `stateUpdate` messages on every auth transition.
+ * Auth: the WebSocket is opened ONLY when `lib/v8-auth` holds a usable profile; a bearer rides as
+ * the `bb-bearer.<token>` WebSocket subprotocol (a browser WebSocket cannot set headers, and a
+ * `?token=` query string is never used). The auth machine owns enrollment/refresh/expiry; this
+ * module owns the socket and reports its lifecycle (open/close 4401) back to auth.
  */
 import type { BridgeMessage } from "../shared/protocol";
-import { compareExtensionVersions, isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
+import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
-import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount, pipeProblem } from "./lib/pipe";
-import { clearTargetTabIfMatches, getTargetTab, getLastWorkspace, setLastWorkspace, installNewTabAdopter, listDccbTabs, focusControlledTab, focusAnyGroupTab, DEDICATED_WINDOW_KEY, LAST_WORKSPACE_KEY, findDccbGroupId, groupTitle } from "./lib/target";
+import { closeAllPipes, closeIdleAiTabs, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, LAST_WORKSPACE_KEY, migrateFromTabGroups, popupTarget, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
-import type { AuthSnapshot } from "./lib/v8-auth";
-import { setHandoffController } from "./lib/tools/handoff";
-import { takeNotificationWorkspace } from "./lib/tools/notify";
-import "./lib/tools"; // side-effect: registers all tools into the registry
+import "./lib/tools"; // side-effect: registers the tools into the registry
 
 const KEEPALIVE_MS = 20_000;
 const BACKOFF_MIN_MS = 1_000;
@@ -35,8 +28,8 @@ const BACKOFF_MAX_MS = 30_000;
 // fire onAlarm. The in-SW reconnect timer + keepalive interval both DIE when
 // Chrome kills the idle SW (30s idle / 5min cap), so on their own the bridge
 // could stay DARK after a termination until some unrelated event woke the SW.
-// This alarm is the only reconnect trigger that outlives the SW. 1 min is just
-// above the MV3 minimum alarm period (~30s) and cheap enough to run idle.
+// This alarm is the only reconnect trigger that outlives the SW, and it also
+// closes AI tabs no engine came back to (lib/pipe.ts closeIdleAiTabs).
 const RECONNECT_ALARM = "bb-reconnect";
 const RECONNECT_ALARM_PERIOD_MIN = 1;
 
@@ -45,51 +38,20 @@ let keepalive: ReturnType<typeof setInterval> | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let backoff = BACKOFF_MIN_MS;
 /** True once the current socket fired 'open'; reset per connect attempt. Lets
- *  handleClose tell "never reached the server" (tailscale unreachable) from a
- *  transient drop of an established connection. */
+ *  handleClose tell "never reached the server" from a transient drop of an
+ *  established connection. */
 let socketOpened = false;
 let latestExtensionVersion: string | null = null;
-let working = 0;
-let dedicatedWindow = false;
-let targetInfo: { title: string; url: string } | null = null;
-let popupError: string | null = null;
-let humanHandoff = false;
-let handoffMessage: string | null = null;
-let pendingHandoff: {
-  resolve: (result: unknown) => void;
-  reject: (error: Error) => void;
-  startedAt: number;
-  tabId: number;
-  timer: ReturnType<typeof setTimeout>;
-} | null = null;
-let activity: { label: string; at: number }[] = [];
-const ACTIVITY_KEY = "v8BrowserBridgeActivity";
-const HANDOFF_KEY = "v8BrowserBridgeHandoff";
-const HANDOFF_MESSAGE_KEY = "v8BrowserBridgeHandoffMessage";
-const ACTIVITY_LABELS: Record<string, string> = {
-  fetch: "페이지 가져오기", handoff: "사람에게 넘기기", notify: "알림", pipe: "AI 작업 공간 연결",
-};
 
 function log(...args: unknown[]): void {
-  console.log("[bb-v6 bg]", ...args);
-}
-
-/** True when the WS is open or mid-handshake (i.e. no reconnect is needed). */
-function wsIsLive(): boolean {
-  return (
-    socket !== null &&
-    (socket.readyState === WebSocket.OPEN ||
-      socket.readyState === WebSocket.CONNECTING)
-  );
+  console.log("[bb bg]", ...args);
 }
 
 // --- Durable wake-and-reconnect (chrome.alarms) ----------------------------
 
 /**
- * Register the periodic reconnect alarm. Idempotent: chrome.alarms.create with
- * the same name replaces any existing schedule, so re-running on every SW wake
- * is safe. Must be called at SW top-level (it is, from defineBackground) so the
- * alarm is (re)established on every cold start.
+ * Register the periodic alarm. Idempotent: chrome.alarms.create with the same
+ * name replaces any existing schedule, so re-running on every SW wake is safe.
  */
 function installReconnectAlarm(): void {
   chrome.alarms.create(RECONNECT_ALARM, {
@@ -97,6 +59,7 @@ function installReconnectAlarm(): void {
   });
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== RECONNECT_ALARM) return;
+    void closeIdleAiTabs().then(closed => { if (closed.length) pushSnapshot(); });
     // The alarm fired — the SW is awake now. If the bridge should be connected
     // but the socket died (typically alongside a prior SW termination), bring
     // it back. backoff is reset so the wake reconnects promptly.
@@ -106,6 +69,15 @@ function installReconnectAlarm(): void {
       openSocket();
     }
   });
+}
+
+/** True when the WS is open or mid-handshake (i.e. no reconnect is needed). */
+function wsIsLive(): boolean {
+  return (
+    socket !== null &&
+    (socket.readyState === WebSocket.OPEN ||
+      socket.readyState === WebSocket.CONNECTING)
+  );
 }
 
 // --- WebSocket (bearer via subprotocol) ------------------------------------
@@ -244,36 +216,24 @@ function handleMessage(msg: BridgeMessage): void {
       break;
     case "latest_extension_version":
       latestExtensionVersion = isExtensionVersion(msg.version) ? msg.version : null;
-      pushSnapshot(auth.snapshot());
+      pushSnapshot();
       break;
     case "tool_request":
-      if (!auth.isEnabled() || humanHandoff) {
-        send({ type: "tool_response", id: msg.id, error: humanHandoff ? "사람이 작업 중입니다. 계속을 누른 뒤 다시 시도하세요" : "Browser Bridge is off" });
+      if (!auth.isEnabled()) {
+        send({ type: "tool_response", id: msg.id, error: "Browser Bridge is not connected" });
         return;
       }
-      working += 1;
-      recordActivity(msg.tool);
-      updateBadge();
-      // Dispatch never throws. An accepted request always gets exactly one
-      // answer: its result (a hand-off to the person does not undo work already
-      // started), or an "off" error when the bridge was switched off meanwhile.
-      void dispatch(msg).then(response => {
-        send(auth.isEnabled() ? response : { type: "tool_response", id: msg.id, error: "Browser Bridge is off" });
-      })
-        .finally(() => { working = Math.max(0, working - 1); updateBadge(); pushSnapshot(auth.snapshot()); });
+      // Dispatch never throws: an accepted request always gets exactly one answer.
+      void dispatch(msg).then(send);
       break;
     case "pipe_open":
-      recordActivity("pipe");
-      void openPipe(msg.channel, msg.workspace).finally(() => pushSnapshot(auth.snapshot()));
+      void openPipe(msg.channel, msg.workspace);
       break;
     case "pipe_command":
-      working += 1;
-      updateBadge();
-      void handlePipeCommand(msg).finally(() => { working = Math.max(0, working - 1); updateBadge(); });
+      void handlePipeCommand(msg);
       break;
     case "pipe_close":
       closePipe(msg.channel);
-      pushSnapshot(auth.snapshot());
       break;
     case "pong":
       // keepalive acknowledged; nothing to do.
@@ -301,241 +261,112 @@ function stopKeepalive(): void {
   }
 }
 
-async function beginHandoff(message: string, timeoutSec: number, workspace: string): Promise<unknown> {
-  if (humanHandoff) throw new Error("사람이 작업 중입니다. 계속을 누른 뒤 다시 시도하세요");
-  humanHandoff = true;
-  handoffMessage = message;
-  await chrome.storage.local.set({ [HANDOFF_KEY]: true, [HANDOFF_MESSAGE_KEY]: message });
-  await setExecutionEnabled(false);
-
-  try {
-    const focused = await focusControlledTab(undefined, workspace);
-    const tabId = focused.tabId as number;
-    await chrome.notifications.create(`bb-handoff-${crypto.randomUUID()}`, {
-      type: "basic",
-      iconUrl: chrome.runtime.getURL("/icon/128.png"),
-      title: "AI가 도움을 요청합니다",
-      message,
-    });
-    const startedAt = Date.now();
-    const result = new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => { void finishHandoff("timeout", timeoutSec); }, timeoutSec * 1000);
-      pendingHandoff = { resolve, reject, startedAt, tabId, timer };
-    });
-    pushSnapshot(auth.snapshot());
-    return await result;
-  } catch (error) {
-    if (humanHandoff) {
-      humanHandoff = false;
-      handoffMessage = null;
-      await chrome.storage.local.set({ [HANDOFF_KEY]: false, [HANDOFF_MESSAGE_KEY]: null });
-      await setExecutionEnabled(auth.isEnabled());
-      pushSnapshot(auth.snapshot());
-    }
-    throw error;
-  }
-}
-
-async function finishHandoff(action: "resumed" | "stopped" | "timeout", timeoutSec?: number): Promise<void> {
-  const waiting = pendingHandoff;
-  pendingHandoff = null;
-  if (waiting) clearTimeout(waiting.timer);
-  humanHandoff = false;
-  handoffMessage = null;
-  await chrome.storage.local.set({ [HANDOFF_KEY]: false, [HANDOFF_MESSAGE_KEY]: null });
-  await setExecutionEnabled(auth.isEnabled());
-  pushSnapshot(auth.snapshot());
-  if (!waiting) return;
-
-  if (action === "resumed") {
-    const tab = await chrome.tabs.get(waiting.tabId).catch(() => undefined);
-    waiting.resolve({ resumed: true, waitedMs: Date.now() - waiting.startedAt, url: tab?.url ?? "", title: tab?.title ?? "" });
-  } else if (action === "stopped") {
-    waiting.reject(new Error("사람이 작업을 중단했습니다"));
-  } else {
-    waiting.reject(new Error(`사람 응답 없음(${timeoutSec}초)`));
-  }
-}
-
-// --- Popup messaging --------------------------------------------------------
+// --- Popup ------------------------------------------------------------------
 
 interface PopupRequest {
-  type: "getState" | "reset" | "setup" | "setEnabled" | "setDeviceName" | "setHandoff" | "stopHandoff" | "focusTarget" | "setDedicatedWindow";
+  type: "getState" | "setup" | "reset" | "setDeviceName" | "focusTarget";
   address?: string;
   code?: string;
-  enabled?: boolean;
   name?: string;
-  handoff?: boolean;
 }
 
-function popupSnapshot(snap: AuthSnapshot) { return { ...snap, latestExtensionVersion, working: working > 0, humanHandoff, handoffMessage, activity, dedicatedWindow, targetInfo, popupError, pipeProblem: pipeProblem(), pipeChannels: pipeChannelCount() }; }
+/** What the popup draws: connection state, and the page the AI is on while an engine is connected. */
+async function popupSnapshot() {
+  const snap = auth.snapshot();
+  const working = pipeChannelCount() > 0;
+  const tab = working ? await popupTarget() : null;
+  return {
+    state: snap.state,
+    error: snap.error,
+    address: snap.address,
+    deviceName: snap.deviceName,
+    version: chrome.runtime.getManifest().version,
+    latestExtensionVersion,
+    working,
+    page: tab ? { title: tab.title ?? "", url: tab.url ?? "", favIconUrl: tab.favIconUrl ?? null } : null,
+  };
+}
 
+/** The toolbar badge: a dot while the AI works in this Chrome, nothing otherwise. */
 function updateBadge(): void {
-  const state = auth.snapshot().state;
-  const currentVersion = chrome.runtime.getManifest().version;
-  const updateAvailable = isExtensionVersion(currentVersion) && isExtensionVersion(latestExtensionVersion)
-    && compareExtensionVersions(currentVersion, latestExtensionVersion) < 0;
-  const badge = working > 0 ? "AI" : updateAvailable ? "NEW" : !auth.isEnabled() ? "OFF" : humanHandoff ? "HOLD" : state === "connected" ? "" : "…";
-  const color = badge === "NEW" ? "#e67e22" : badge === "OFF" || badge === "HOLD" ? "#777" : badge === "AI" ? "#1769c2" : badge === "" ? "#238153" : "#aa7617";
-  void chrome.action.setBadgeText({ text: badge });
-  void chrome.action.setBadgeBackgroundColor({ color });
+  const working = pipeChannelCount() > 0;
+  void chrome.action.setBadgeText({ text: working ? " " : "" });
+  void chrome.action.setBadgeBackgroundColor({ color: "#6d5efc" });
 }
 
-function recordActivity(tool: string): void {
-  activity = [{ label: ACTIVITY_LABELS[tool] ?? "브라우저 작업", at: Date.now() }, ...activity].slice(0, 5);
-  void chrome.storage.local.set({ [ACTIVITY_KEY]: activity });
-  pushSnapshot(auth.snapshot());
-}
-
-async function refreshTargetInfo(): Promise<void> {
-  const workspace = getLastWorkspace();
-  const tabs = await listDccbTabs(workspace);
-  const tab = tabs.find(t => t.id === getTargetTab(workspace)) ?? tabs[0];
-  targetInfo = tab ? { title: tab.title ?? "", url: tab.url ?? "" } : null;
-}
-
-function pushSnapshot(snap: AuthSnapshot): void {
-  void refreshTargetInfo().then(() => chrome.runtime.sendMessage({ type: "stateUpdate", snapshot: popupSnapshot(auth.snapshot()) }).catch(() => {}));
+function pushSnapshot(): void {
   updateBadge();
-  // Best-effort: ignore "no receiver" when the popup is closed.
-  chrome.runtime
-    .sendMessage({ type: "stateUpdate", snapshot: popupSnapshot(snap) })
-    .catch(() => {});
+  // Best-effort: there is no receiver while the popup is closed.
+  void popupSnapshot().then(snapshot => chrome.runtime.sendMessage({ type: "stateUpdate", snapshot })).catch(() => {});
 }
 
 function installPopupBridge(): void {
-  chrome.runtime.onMessage.addListener(
-    (
-      raw: unknown,
-      _sender,
-      sendResponse: (snap: ReturnType<typeof popupSnapshot>) => void,
-    ): boolean => {
-      const req = raw as PopupRequest;
-      const reply = (): void => sendResponse(popupSnapshot(auth.snapshot()));
-      switch (req?.type) {
-        case "getState":
-          void refreshTargetInfo().then(reply);
-          return true;
-        case "setup":
-          void auth.setup(req.address ?? "", req.code ?? "").then(reply);
-          return true;
-        case "reset":
-          humanHandoff = false;
-          void chrome.storage.local.set({ [HANDOFF_KEY]: false });
-          void setExecutionEnabled(false).then(() => auth.reset()).then(reply);
-          return true;
-        case "setEnabled":
-          void (async () => {
-            if (req.enabled === false) await setExecutionEnabled(false);
-            await auth.setEnabled(req.enabled === true);
-            if (req.enabled === true && !humanHandoff) await setExecutionEnabled(true);
-            reply();
-          })();
-          return true;
-        case "setDeviceName":
-          void findDccbGroupId().then(async groupId => {
-            // The group is found by its title, so rename it together with the device.
-            await auth.setDeviceName(req.name ?? "");
-            if (groupId !== null) await chrome.tabGroups.update(groupId, { title: groupTitle() });
-            reply();
-          });
-          return true;
-        case "focusTarget":
-          // A Chrome error here is not something the person can act on: log it
-          // and only say so when there is simply no AI tab to show.
-          void focusAnyGroupTab(getLastWorkspace())
-            .then(found => { popupError = found ? null : "아직 AI 작업 탭이 없습니다"; })
-            .catch(e => { log("focus AI tab failed", String(e)); popupError = null; })
-            .then(reply);
-          return true;
-        case "setDedicatedWindow":
-          dedicatedWindow = req.enabled === true;
-          void chrome.storage.local.set({ [DEDICATED_WINDOW_KEY]: dedicatedWindow }).then(reply);
-          return true;
-        case "setHandoff":
-          if (req.handoff === true) {
-            if (!humanHandoff) {
-              humanHandoff = true;
-              handoffMessage = null;
-              void chrome.storage.local.set({ [HANDOFF_KEY]: true, [HANDOFF_MESSAGE_KEY]: null });
-              void setExecutionEnabled(false);
-              pushSnapshot(auth.snapshot());
-            }
-            reply();
-          } else {
-            void finishHandoff("resumed").then(reply);
-          }
-          return true;
-        case "stopHandoff":
-          void finishHandoff("stopped").then(reply);
-          return true;
-        default:
-          return false;
-      }
-    },
-  );
+  chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse: (snapshot: unknown) => void): boolean => {
+    const req = raw as PopupRequest;
+    const reply = (): void => void popupSnapshot().then(sendResponse);
+    switch (req?.type) {
+      case "getState":
+        reply();
+        return true;
+      case "setup":
+        void auth.setup(req.address ?? "", req.code ?? "").then(reply);
+        return true;
+      case "reset":
+        void setExecutionEnabled(false).then(() => auth.reset()).then(reply);
+        return true;
+      case "setDeviceName":
+        void auth.setDeviceName(req.name ?? "").then(reply);
+        return true;
+      case "focusTarget":
+        // The person asked to see the AI's tab; a Chrome error here is only logged.
+        void focusPopupTarget().catch(error => log("focus AI tab failed", String(error))).then(reply);
+        return true;
+      default:
+        return false;
+    }
+  });
 }
 
 // --- Boot -------------------------------------------------------------------
 
 // This body runs on EVERY service-worker start (cold boot AND every wake after
-// an MV3 termination), so it is the single re-init point for all module state
-// that does not survive SW death. What is lost on SW death, and why it is safe:
-//   - cdp attached-tabs Set       → empty on restart; the pipe re-attaches via
-//     ensureAttached, and installDetachListener re-registers below. SAFE.
-//   - pipe channels               → the relay WS dies with the SW, so the relay
-//     ends every engine and the next pc-browser command reconnects. SAFE.
-//   - WS connection               → closed by SW death. Reconnect is durable via
-//     the chrome.alarms wake below + auth.init's cold-start openSocket(), since
-//     the in-SW setTimeout/keepalive die with the SW. Auth state (enabled,
-//     tokens) lives in chrome.storage, so on wake the SW knows to reconnect.
+// an MV3 termination), so it is the single re-init point for module state that
+// does not survive SW death:
+//   - cdp attached-tabs Set → empty on restart; the pipe re-attaches and
+//     installDetachListener re-registers below.
+//   - pipe channels → the relay WS dies with the SW, so the relay ends every
+//     engine and the next pc-browser command reconnects.
+//   - WS connection → reconnect is durable via the alarm + auth.init's
+//     cold-start openSocket(); auth state lives in chrome.storage.
 export default defineBackground(() => {
   log("service worker started; tools:", toolNames().join(", "));
-  // Durable wake-and-reconnect: outlives SW termination, unlike the in-SW
-  // reconnect timer + keepalive. Registered first so it is in place even if a
-  // later init step throws.
   installReconnectAlarm();
   installDetachListener();
-  // Forget the working tab when it closes or its debugger detaches, so the popup and handoff
-  // never target a dead tab.
+  // Forget the working tab when it closes or its debugger detaches.
   onDetach((tabId) => clearTargetTabIfMatches(tabId));
   chrome.tabs.onRemoved.addListener((tabId) => clearTargetTabIfMatches(tabId));
-  // Discoverability for pages opened by a controlled renderer. webNavigation's
-  // sourceTabId—not openerTabId or click timing—identifies the source. Chrome
-  // may activate/focus a target before that event arrives; only after source
-  // confirmation do we group it and restore the prior selection/focus.
+  // Pages a controlled tab opens (target=_blank, window.open) join its work space, confirmed by
+  // webNavigation's sourceTabId; Chrome's own focus change for them is undone.
   installNewTabAdopter();
-  // Pipe (1.1.0): raw chrome.debugger channel for agent-browser on the HOME (`pc-browser`).
   installPipe(
     frame => send(frame),
-    () => pushSnapshot(auth.snapshot()),
-    () => !auth.isEnabled() ? "Browser Bridge is off" : humanHandoff ? "사람이 작업 중입니다. 계속을 누른 뒤 다시 시도하세요" : null,
+    () => pushSnapshot(),
+    () => auth.isEnabled() ? null : "Browser Bridge is not connected",
   );
-  setHandoffController(beginHandoff);
-  chrome.notifications.onClicked.addListener((notificationId) => {
-    void focusControlledTab(undefined, takeNotificationWorkspace(notificationId) ?? getLastWorkspace()).catch(() => {});
-  });
   installPopupBridge();
+  // Once, on the first start of 6.0.0 (guarded by a stored flag): leave 1.2.x's tab group behind.
+  void migrateFromTabGroups().catch(error => log("migration failed", String(error)));
 
-  void chrome.storage.local.get([ACTIVITY_KEY, HANDOFF_KEY, HANDOFF_MESSAGE_KEY, DEDICATED_WINDOW_KEY, LAST_WORKSPACE_KEY]).then(stored => {
-    dedicatedWindow = stored[DEDICATED_WINDOW_KEY] === true;
+  void chrome.storage.local.get([LAST_WORKSPACE_KEY]).then(stored => {
     if (stored[LAST_WORKSPACE_KEY] !== undefined) {
       try { setLastWorkspace(stored[LAST_WORKSPACE_KEY]); } catch { /* stale workspace storage is ignored */ }
     }
-    activity = Array.isArray(stored[ACTIVITY_KEY]) ? stored[ACTIVITY_KEY].slice(0, 5) : [];
-    humanHandoff = stored[HANDOFF_KEY] === true;
-    handoffMessage = humanHandoff && typeof stored[HANDOFF_MESSAGE_KEY] === "string" ? stored[HANDOFF_MESSAGE_KEY] : null;
-    if (humanHandoff) void setExecutionEnabled(false);
-    pushSnapshot(auth.snapshot());
-    // Enrollment is loaded only after the persisted handoff gate, so a service
-    // worker wake never briefly accepts work while the person has the tab.
     return auth.init({
       openSocket,
       closeSocket,
       onChange: snap => {
-        if (!snap.enabled || snap.state === "off" || snap.state === "setup" || snap.state === "expired" || snap.state === "address_error") void setExecutionEnabled(false);
-        else if (!humanHandoff) void setExecutionEnabled(true);
-        pushSnapshot(snap);
+        void setExecutionEnabled(snap.state === "connected" || snap.state === "connecting");
+        pushSnapshot();
       },
     });
   });

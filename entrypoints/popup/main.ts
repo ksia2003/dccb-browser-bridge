@@ -1,122 +1,143 @@
-import type { AuthSnapshot } from "../lib/v8-auth";
 import { compareExtensionVersions, isExtensionVersion } from "../../shared/protocol";
 
-type PopupSnapshot = AuthSnapshot & {
+/** What the service worker sends (background.ts popupSnapshot). */
+interface PopupSnapshot {
+  state: "setup" | "connecting" | "connected" | "off" | "expired" | "address_error";
+  error: string | null;
+  address: string | null;
+  deviceName: string;
+  version: string;
   latestExtensionVersion: string | null;
   working: boolean;
-  dedicatedWindow: boolean;
-  targetInfo: { title: string; url: string } | null;
-  popupError: string | null;
-  pipeProblem: { message: string; at: number } | null;
-  humanHandoff: boolean;
-  handoffMessage: string | null;
-  activity: { label: string; at: number }[];
-};
+  page: { title: string; url: string; favIconUrl: string | null } | null;
+}
 type Request =
-  | { type: "getState" | "reset" }
+  | { type: "getState" | "reset" | "focusTarget" }
   | { type: "setup"; address: string; code: string }
-  | { type: "setEnabled"; enabled: boolean }
-  | { type: "setDeviceName"; name: string }
-  | { type: "setHandoff"; handoff: boolean }
-  | { type: "stopHandoff" }
-  | { type: "setDedicatedWindow"; enabled: boolean }
-  | { type: "focusTarget" };
+  | { type: "setDeviceName"; name: string };
 
-let current: PopupSnapshot | null = null;
+const STORE_URL = "https://chromewebstore.google.com/detail/gphieniaobkdapliaeihgmhhphcfbafp";
+// A Web Store install carries update_url and Chrome updates it by itself; an unpacked copy does not.
+const fromStore = Boolean((chrome.runtime.getManifest() as { update_url?: string }).update_url);
+
 const address = byId<HTMLInputElement>("address");
 const code = byId<HTMLInputElement>("code");
 const deviceName = byId<HTMLInputElement>("device-name");
-const currentVersion = chrome.runtime.getManifest().version;
-byId("version").textContent = `v${currentVersion}`;
+const menu = byId("menu");
+const more = byId<HTMLButtonElement>("more");
+let pending = false;
 
-function clock(at: number | null): string {
-  return at ? new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit" }).format(at) : "—";
+function host(url: string): string {
+  try { return new URL(url).host; } catch { return url; }
 }
+
 function render(s: PopupSnapshot): void {
-  current = s;
-  byId<HTMLInputElement>("dedicated-window").checked = s.dedicatedWindow;
-  byId("target-info").textContent = s.targetInfo ? s.targetInfo.title + "\n" + s.targetInfo.url : "제어 탭 없음";
-  byId("last-action").textContent = "마지막 동작: " + clock(s.activity[0]?.at ?? null);
-  byId("focus-error").textContent = s.popupError ?? "";
-  byId("pipe-problem").textContent = s.pipeProblem ? `AI 작업 멈춤 (${clock(s.pipeProblem.at)}): ${s.pipeProblem.message}` : "";
-  const latest = s.latestExtensionVersion;
-  const hasUpdate = isExtensionVersion(currentVersion) && isExtensionVersion(latest)
-    && compareExtensionVersions(currentVersion, latest) < 0;
-  byId("update-banner").hidden = !hasUpdate;
-  byId("update-title").textContent = hasUpdate ? `새 버전 ${latest}이 나왔어요 (지금 ${currentVersion})` : "";
-  byId("update-instructions").textContent = hasUpdate
-    ? "개발 대시보드 › Browser Bridge 연결 스레드에서 ZIP을 받아 지금 확장 폴더에 덮어쓰고, chrome://extensions에서 ↻를 누르세요."
-    : "";
-  const labels: Record<AuthSnapshot["state"], string> = {
-    setup: "연결 전", connecting: "재연결 중", connected: "연결됨", off: "꺼짐",
-    expired: "등록 만료", address_error: "주소 오류",
-  };
   const setup = s.state === "setup" || s.state === "expired" || s.state === "address_error";
-  byId("setup-panel").hidden = !setup;
-  byId("connected-panel").hidden = setup;
-  byId("status-label").textContent = s.working && s.enabled && !s.humanHandoff ? "AI 작업 중" : labels[s.state];
-  byId("status-dot").className = `dot ${s.state}`;
-  byId("summary").textContent = s.humanHandoff ? "사람이 처리하는 동안 AI 작업을 보류합니다." :
-    s.state === "off" ? "AI가 이 Chrome에 접근할 수 없습니다." :
-    s.state === "connecting" ? "연결을 자동으로 다시 시도합니다." :
-    s.state === "connected" ? "필요할 때만 DCCB 전용 탭에서 작업합니다." : "대시보드의 주소와 코드를 입력하세요.";
-  byId("setup-error").textContent = s.error ?? "";
-  byId("setup-error").hidden = !s.error;
-  byId("diagnosis").textContent = s.state === "connected" ? "진단: 서버 연결 정상" :
-    s.state === "off" ? "진단: 사용자가 브릿지를 껐습니다." :
-    s.state === "expired" ? "진단: 등록이 만료되었습니다. 새 코드가 필요합니다." :
-    s.state === "address_error" ? `진단: ${s.error ?? "주소를 확인하세요."}` :
-    s.state === "connecting" ? "진단: Chrome 인터넷 연결과 서버 상태를 확인하세요." : "진단: 등록이 필요합니다.";
-  byId("connected-address").textContent = s.address ?? "—";
-  byId("last-connected").textContent = clock(s.lastConnectedAt);
-  byId("next-retry").textContent = clock(s.nextRetryAt);
-  const toggle = byId<HTMLButtonElement>("toggle");
-  toggle.classList.toggle("on", s.enabled);
-  toggle.setAttribute("aria-checked", String(s.enabled));
+  byId("setup").hidden = !setup;
+  byId("status").hidden = setup;
+  more.hidden = setup;
+  if (setup) closeMenu();
+  byId("version").textContent = `v${s.version}`;
+  byId("device").textContent = setup ? "연결 전" : s.deviceName;
   if (document.activeElement !== deviceName) deviceName.value = s.deviceName;
-  byId("handoff").textContent = s.humanHandoff ? "계속" : "넘기기";
-  const handoffMessage = byId("handoff-message");
-  handoffMessage.hidden = !s.humanHandoff || s.handoffMessage === null;
-  handoffMessage.textContent = s.handoffMessage ?? "";
-  byId<HTMLButtonElement>("stop-handoff").hidden = !s.humanHandoff || s.handoffMessage === null;
-  const activity = byId("activity");
-  activity.replaceChildren();
-  if (s.activity.length === 0) {
-    const empty = document.createElement("li");
-    empty.textContent = "아직 동작이 없습니다.";
-    activity.append(empty);
+
+  const setupError = byId("setup-error");
+  const error = s.state === "expired" ? "코드가 만료됐습니다. 대시보드에서 새 코드를 받아 주세요." : s.error;
+  setupError.hidden = !error;
+  setupError.textContent = error ?? "";
+  byId<HTMLButtonElement>("connect").disabled = pending;
+
+  const look = s.working ? { cls: "busy", icon: "#spark", title: "AI가 작업 중", desc: "내 탭은 그대로 둡니다." }
+    : s.state === "connected" ? { cls: "ok", icon: "#check", title: "연결됨", desc: "AI가 필요할 때 뒤쪽 탭에서 일하고\n끝나면 닫습니다." }
+    : { cls: "idle", icon: "#sync", title: "다시 연결하는 중", desc: "서버와 잠깐 끊겼습니다.\n알아서 다시 잇습니다." };
+  byId("orb").className = `orb ${look.cls}`;
+  byId("orb-icon").setAttribute("href", look.icon);
+  byId("title").textContent = look.title;
+  byId("desc").innerText = look.desc;
+  byId("dev-dot").className = `dot ${setup ? "idle" : look.cls}`;
+
+  const card = byId<HTMLButtonElement>("card");
+  card.hidden = !(s.working && s.page);
+  if (s.working && s.page) {
+    byId("page-title").textContent = s.page.title || host(s.page.url);
+    byId("page-host").textContent = host(s.page.url);
+    const fav = byId("fav");
+    fav.replaceChildren();
+    if (s.page.favIconUrl && /^https?:/.test(s.page.favIconUrl)) {
+      const img = document.createElement("img");
+      img.src = s.page.favIconUrl;
+      img.alt = "";
+      img.addEventListener("error", () => { fav.textContent = host(s.page!.url).slice(0, 1).toUpperCase(); });
+      fav.append(img);
+    } else {
+      fav.textContent = host(s.page.url).slice(0, 1).toUpperCase();
+    }
   }
-  for (const item of s.activity) {
-    const li = document.createElement("li");
-    li.append(document.createTextNode(item.label));
-    const time = document.createElement("time");
-    time.textContent = clock(item.at);
-    li.append(time);
-    activity.append(li);
+
+  // Only an unpacked copy needs the person to update it; the Web Store copy updates itself.
+  const latest = s.latestExtensionVersion;
+  const outdated = !fromStore && isExtensionVersion(s.version) && isExtensionVersion(latest) && compareExtensionVersions(s.version, latest) < 0;
+  const update = byId("update");
+  update.hidden = !outdated;
+  if (outdated) {
+    update.replaceChildren();
+    const strong = document.createElement("b");
+    strong.textContent = `새 버전 ${latest}이 나왔어요.`;
+    const link = document.createElement("a");
+    link.href = STORE_URL;
+    link.target = "_blank";
+    link.textContent = "Chrome 웹스토어에서 설치";
+    update.append(strong, document.createElement("br"), link, "하면 이후로는 알아서 업데이트됩니다.");
   }
 }
+
 async function ask(request: Request): Promise<void> {
   const response = await chrome.runtime.sendMessage(request) as PopupSnapshot | undefined;
   if (response) render(response);
 }
-byId("connect").addEventListener("click", () => void ask({ type: "setup", address: address.value, code: code.value }));
-byId("reset").addEventListener("click", () => void ask({ type: "reset" }));
-byId("toggle").addEventListener("click", () => void ask({ type: "setEnabled", enabled: !current?.enabled }));
-byId<HTMLInputElement>("dedicated-window").addEventListener("change", e => void ask({ type: "setDedicatedWindow", enabled: (e.target as HTMLInputElement).checked }));
-byId("show-ai-tab").addEventListener("click", () => void ask({ type: "focusTarget" }));
-byId("handoff").addEventListener("click", () => void ask({ type: "setHandoff", handoff: !current?.humanHandoff }));
-byId("stop-handoff").addEventListener("click", () => void ask({ type: "stopHandoff" }));
-deviceName.addEventListener("change", () => void ask({ type: "setDeviceName", name: deviceName.value }));
+
+function closeMenu(): void {
+  menu.hidden = true;
+  more.setAttribute("aria-expanded", "false");
+}
+
+byId("setup-form").addEventListener("submit", event => {
+  event.preventDefault();
+  pending = true;
+  byId<HTMLButtonElement>("connect").disabled = true;
+  void ask({ type: "setup", address: address.value, code: code.value }).finally(() => { pending = false; byId<HTMLButtonElement>("connect").disabled = false; });
+});
 code.addEventListener("input", () => { code.value = code.value.toUpperCase().replace(/[^A-Z2-9]/g, "").slice(0, 8); });
 code.addEventListener("paste", event => {
   const text = event.clipboardData?.getData("text") ?? "";
   const match = text.toUpperCase().replace(/[^A-Z2-9]/g, "").match(/[A-Z2-9]{8}/);
   if (match) { event.preventDefault(); code.value = match[0]; }
 });
-code.addEventListener("keydown", event => { if (event.key === "Enter") void ask({ type: "setup", address: address.value, code: code.value }); });
+byId("card").addEventListener("click", () => void ask({ type: "focusTarget" }).then(() => window.close()));
+more.addEventListener("click", () => {
+  const open = menu.hidden;
+  menu.hidden = !open;
+  more.setAttribute("aria-expanded", String(open));
+  if (open) deviceName.focus();
+});
+document.addEventListener("click", event => {
+  if (!menu.hidden && !menu.contains(event.target as Node) && !more.contains(event.target as Node)) closeMenu();
+});
+document.addEventListener("keydown", event => { if (event.key === "Escape") closeMenu(); });
+byId("name-form").addEventListener("submit", event => {
+  event.preventDefault();
+  void ask({ type: "setDeviceName", name: deviceName.value }).then(closeMenu);
+});
+deviceName.addEventListener("change", () => void ask({ type: "setDeviceName", name: deviceName.value }));
+byId("reset").addEventListener("click", () => {
+  if (!confirm("이 Chrome의 연결을 지우고 주소와 코드를 다시 넣을까요?")) return;
+  closeMenu();
+  void ask({ type: "reset" });
+});
 chrome.runtime.onMessage.addListener((raw: unknown) => {
   const message = raw as { type?: string; snapshot?: PopupSnapshot };
   if (message.type === "stateUpdate" && message.snapshot) render(message.snapshot);
 });
 void ask({ type: "getState" });
+
 function byId<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }

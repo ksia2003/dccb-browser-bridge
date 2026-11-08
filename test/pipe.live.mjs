@@ -111,32 +111,56 @@ try {
   assert.match(ab("eval", "fetch('https://example.com/mock').then(r => r.text())").out, /mocked/);
   console.log("  PASS  network route mock");
 
-  const before = (await pages()).length;
-  for (let i = 1; i <= 3; i++) {
-    assert.ok(ab("close").ok);
-    assert.ok(ab("--cdp", cdp, "open", `https://example.org/?run=${i}`).ok);
-  }
-  assert.equal((await pages()).length, before, "reconnecting reuses the work space's tab");
-  console.log("  PASS  three reconnects open no new tab");
-
-  // Another work space uses the same one AI group (owner 11-08: no group per work space).
-  execFileSync(agentBrowser, ["--session", `${session}-ws2`, "--cdp", `ws://127.0.0.1:${httpPort}/cdp/second`, "open", "https://example.org/"], { stdio: "ignore", timeout: 40_000 });
-  execFileSync(agentBrowser, ["--session", `${session}-ws2`, "close"], { stdio: "ignore", timeout: 40_000 });
   const sw = (await fetch(`http://127.0.0.1:${chromePort}/json/list`).then(r => r.json())).find(t => t.url === `chrome-extension://${id}/background.js`);
-  const titles = await evaluate(sw.webSocketDebuggerUrl, "chrome.tabGroups.query({}).then(groups => groups.map(group => group.title))");
-  assert.deepEqual(titles, ["AI · Linux의 Chrome"], "one AI group for both work spaces");
-  console.log("  PASS  a second work space shares the one AI group");
+  const inWorker = expression => evaluate(sw.webSocketDebuggerUrl, expression);
+  const aiTabs = () => inWorker("chrome.storage.session.get('v8TabWorkspaces').then(s => chrome.tabs.query({}).then(tabs => tabs.filter(t => s.v8TabWorkspaces?.[t.id]).map(t => t.url)))");
 
-  // The extension's own tools that stay in 1.2.0 (fetch, notify, handoff, extension) still answer
-  // over /send; a page tool that moved to the pipe says so.
+  // close closes the AI tab (no idle tab left behind); the next task opens one background tab.
+  assert.equal((await aiTabs()).length, 1, "one AI tab while the engine works");
+  assert.ok(ab("close").ok);
+  await sleep(500);
+  assert.deepEqual(await aiTabs(), [], "close closes the AI tab; nothing is left behind");
+  assert.ok(ab("--cdp", cdp, "open", "https://example.org/?again").ok);
+  assert.equal((await aiTabs()).length, 1, "the next task opens one background tab");
+  console.log("  PASS  close closes the AI tab; the next task opens one");
+
+  // No tab group at all (owner 11-08: Chrome keeps every group in its saved-groups bar), and a second
+  // work space sees only its own tab.
+  execFileSync(agentBrowser, ["--session", `${session}-ws2`, "--cdp", `ws://127.0.0.1:${httpPort}/cdp/second`, "open", "https://example.org/?second"], { stdio: "ignore", timeout: 40_000 });
+  const secondList = execFileSync(agentBrowser, ["--session", `${session}-ws2`, "tab", "list"], { encoding: "utf8", timeout: 40_000 });
+  assert.match(secondList, /second/);
+  assert.doesNotMatch(secondList, /again/, "the second work space does not see the first one's tab");
+  const grouped = await inWorker("chrome.tabs.query({}).then(tabs => tabs.filter(t => t.groupId >= 0).length)");
+  assert.equal(grouped, 0, "no tab is in a group");
+  const active = await inWorker("chrome.tabs.query({ active: true }).then(tabs => tabs.map(t => t.url))");
+  assert.ok(active.every(url => !/example\.org/.test(url)), `the AI tabs stay in the background: ${active}`);
+  execFileSync(agentBrowser, ["--session", `${session}-ws2`, "close"], { stdio: "ignore", timeout: 40_000 });
+  console.log("  PASS  no tab group; work spaces see only their own tabs; AI tabs stay in the background");
+
+  // The extension's own tools (fetch, extension) answer over /send; removed tools say where to go.
   const send = body => control("/send", body);
   const fetched = await send({ tool: "fetch", args: { url: "https://example.com/" } });
   assert.equal(fetched.result?.status, 200, JSON.stringify(fetched).slice(0, 200));
-  assert.equal((await send({ tool: "notify", args: { message: "pipe live" } })).result?.ok, true);
   assert.equal((await send({ tool: "extension", args: {} })).result?.version, browsers[0].version);
-  assert.match((await send({ tool: "handoff", args: { message: "live", timeoutSec: 1, workspace: "live" } })).error ?? "", /사람 응답 없음\(1초\)/);
-  assert.match((await send({ tool: "page", args: { action: "snapshot" } })).error ?? "", /unknown_tool: page .*pc-browser/);
-  console.log("  PASS  the extension's own tools: fetch, notify, handoff (times out honestly), extension; old page tools are gone");
+  for (const gone of ["handoff", "notify", "page"]) {
+    assert.match((await send({ tool: gone, args: {} })).error ?? "", new RegExp(`unknown_tool: ${gone} .*pc-browser`));
+  }
+  console.log("  PASS  the extension's own tools: fetch, extension; handoff, notify and page tools are gone");
+
+  // Updating from 1.2.x ungroups its "AI · …" group (test/target.unit.test.mjs has the logic). An
+  // extension reload drops a --load-extension copy here, so check only that Chrome lets 6.0.0 ungroup
+  // without the tabGroups permission it no longer has.
+  const ungroupedLive = await inWorker(`(async () => {
+    const tab = await chrome.tabs.create({ url: "https://example.net/?left", active: false });
+    await chrome.tabs.group({ tabIds: [tab.id] });
+    const grouped = (await chrome.tabs.get(tab.id)).groupId >= 0;
+    await chrome.tabs.ungroup([tab.id]);
+    const after = (await chrome.tabs.get(tab.id)).groupId;
+    await chrome.tabs.remove(tab.id);
+    return grouped && after === -1 && typeof chrome.tabGroups === "undefined";
+  })()`);
+  assert.equal(ungroupedLive, true, "chrome.tabs.ungroup works without the tabGroups permission");
+  console.log("  PASS  1.2.x's group can be ungrouped without the tabGroups permission");
 
   const other = execFileSync(agentBrowser, ["--session", `${session}-2`, "--cdp", cdp, "open", "https://example.com/"], { encoding: "utf8", timeout: 40_000, stdio: ["ignore", "pipe", "pipe"] }).toString();
   assert.fail(`a second engine on the same work space must be refused, got: ${other}`);

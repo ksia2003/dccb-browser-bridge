@@ -6,7 +6,7 @@
  *     Remote connections require a route-bound bearer issued by code redemption.
  *     A same-box loopback connection may still use the legacy local path.
  *   - HTTP on <HTTP_HOST>:8766 — POST /send injects a tool_request (10s timeout;
- *     handoff waits for the extension's human-response timeout),
+ *     fetch ends on the extension's own limits),
  *     optional `target` browserId selects which browser; GET /browsers lists the
  *     connected browsers (so the AI can discover targets); plus the auth routes:
  *     AND hosts the RFC 8628 auth endpoints:
@@ -563,8 +563,8 @@ export function invokeTool(
       args,
     };
 
-    // fetch and handoff (which waits for a person) end on the extension's own limits.
-    const timer = tool === "fetch" || tool === "handoff" ? undefined : setTimeout(() => {
+    // fetch ends on the extension's own limits.
+    const timer = tool === "fetch" ? undefined : setTimeout(() => {
       pending.delete(request.id);
       reject(new ToolDispatchError(`tool timeout: ${tool}`, "timeout"));
     }, REQUEST_TIMEOUT_MS);

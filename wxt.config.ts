@@ -8,7 +8,7 @@ export default defineConfig({
   manifest: {
     name: "DCCB Browser Bridge",
     description:
-      "내 DCCB 서버의 AI가 이 Chrome의 AI 탭 그룹에서 웹 작업을 하도록 잇는 통로입니다. 사람의 탭은 건드리지 않습니다.",
+      "내 DCCB 서버의 AI가 이 Chrome의 뒤쪽 탭에서 웹 작업을 하도록 잇습니다. 내 탭은 건드리지 않습니다.",
     version,
     // manifest_version is fixed to 3 by WXT's chrome-mv3 target (do not set here).
 
@@ -20,6 +20,7 @@ export default defineConfig({
 
     icons: {
       16: "/icon/16.png",
+      32: "/icon/32.png",
       48: "/icon/48.png",
       128: "/icon/128.png",
     },
@@ -28,6 +29,7 @@ export default defineConfig({
       default_title: "DCCB Browser Bridge",
       default_icon: {
         16: "/icon/16.png",
+        32: "/icon/32.png",
         48: "/icon/48.png",
         128: "/icon/128.png",
       },
@@ -36,11 +38,9 @@ export default defineConfig({
     permissions: [
       "tabs",
       "debugger",
-      "tabGroups",
       "storage",
       "alarms",
       "webNavigation",
-      "notifications",
     ],
     host_permissions: ["<all_urls>"],
   },

@@ -1,7 +1,8 @@
 /**
- * AI tab group tests for lib/target.ts: ownership, the idle tab, the dedicated AI window and the
- * new-tab adopter. These run without Chrome: the small chrome.* double below models only the APIs
- * target.ts uses.
+ * lib/target.ts (6.0.0): the AI's tabs are ordinary background tabs it opened itself, never grouped,
+ * never brought forward except from the popup's card; pages they open join their work space; the
+ * pre-6.0.0 tab group is left behind once. These run without Chrome: the small chrome.* double below
+ * models only the APIs target.ts uses (it has no tabs.group, so any grouping fails the run).
  *
  * Run: npm run test:unit
  */
@@ -33,11 +34,11 @@ const updates = [];
 const windowUpdates = [];
 const creations = [];
 const moves = [];
-const grouped = [];
-// The connection finds its group by title when storage has no id (1.0.8), as after a Chrome restart.
-const groups = new Map([[1, { id: 1, title: "AI · 이 컴퓨터의 Chrome" }]]);
+const createdWindows = [];
+const ungrouped = [];
 const stored = {};
-const sessionStored = {};
+// Tabs 10 and 40 were opened for the AI in this browser session.
+const sessionStored = { v8TabWorkspaces: { 10: "default", 40: "default" } };
 const windowsById = new Map([
   [1, { id: 1, focused: true, type: "normal" }],
   [2, { id: 2, focused: false, type: "popup" }],
@@ -104,15 +105,12 @@ globalThis.chrome = {
         await onRemoved.emit(id);
       }
     },
-    async group({ tabIds, groupId }) {
-      const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
-      for (const id of ids) {
+    async ungroup(ids) {
+      for (const id of [ids].flat()) {
         const tab = tabsById.get(id);
-        if (tab) tab.groupId = groupId ?? 1;
+        if (tab) tab.groupId = -1;
+        ungrouped.push(id);
       }
-      if (!groups.has(groupId ?? 1)) groups.set(groupId ?? 1, { id: groupId ?? 1, title: "" });
-      grouped.push({ ids, groupId: groupId ?? 1 });
-      return groupId ?? 1;
     },
     async create(createProperties = {}) {
       const id = Math.max(...tabsById.keys()) + 1;
@@ -123,15 +121,6 @@ globalThis.chrome = {
       return { ...tab };
     },
   },
-  tabGroups: {
-    async get(id) { if (!groups.has(id)) throw new Error(`group ${id} not found`); return { ...groups.get(id) }; },
-    async query(query) {
-      return [...groups.values()].filter((group) => !query?.title || group.title === query.title).map(group => ({ ...group }));
-    },
-    async update(id, patch) {
-      Object.assign(groups.get(id), patch);
-    },
-  },
   windows: {
     onCreated: onWindowCreated,
     onRemoved: onWindowRemoved,
@@ -139,9 +128,16 @@ globalThis.chrome = {
     WINDOW_ID_NONE: -1,
     async getAll() { return [...windowsById.values()].map(window => ({ ...window })); },
     async get(id) { if (!windowsById.has(id)) throw new Error(`window ${id} not found`); return { ...windowsById.get(id) }; },
-    async create({ url }) {
-      const id = Math.max(...windowsById.keys()) + 1;
-      windowsById.set(id, { id, focused: false, type: "normal" });
+    async getLastFocused({ windowTypes } = {}) {
+      const normal = [...windowsById.values()].filter(window => !windowTypes || windowTypes.includes(window.type));
+      const window = normal.find(window => window.focused) ?? normal.at(-1);
+      if (!window) throw new Error("No last-focused window");
+      return { ...window };
+    },
+    async create({ url, focused }) {
+      const id = Math.max(0, ...windowsById.keys()) + 1;
+      windowsById.set(id, { id, focused: focused !== false, type: "normal" });
+      createdWindows.push({ id, focused });
       return { id, tabs: [await chrome.tabs.create({ url, windowId: id, active: true })] };
     },
     async update(id, changes) {
@@ -164,18 +160,22 @@ globalThis.chrome = {
     local: {
       async get(key) { return typeof key === "string" ? (key in stored ? { [key]: stored[key] } : {}) : { ...stored }; },
       async set(values) { Object.assign(stored, values); },
+      async remove(keys) { for (const key of [keys].flat()) delete stored[key]; },
     },
   },
 };
 
 const {
-  resolveTabId,
   createControlledTab,
   installNewTabAdopter,
-  idleUrl,
   listDccbTabs,
+  listAiTabs,
   isControlledTab,
-  focusAnyGroupTab,
+  ownerOf,
+  popupTarget,
+  focusPopupTarget,
+  migrateFromTabGroups,
+  setTargetTab,
 } = await import("../entrypoints/lib/target.ts");
 
 let passed = 0;
@@ -191,209 +191,138 @@ function check(name, condition, detail = "") {
     console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`);
   }
 }
-
-async function expectReject(promise, text) {
-  try {
-    await promise;
-    return false;
-  } catch (error) {
-    return String(error?.message ?? error).includes(text);
-  }
-}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 installNewTabAdopter();
-await new Promise((resolve) => setTimeout(resolve, 0));
+await tick();
 
-// All resolveTabId callers, including evaluate/page/etc., share this gate.
 check(
-  "explicit personal tab is rejected by resolveTabId",
-  await expectReject(resolveTabId(20), "not a bridge-controlled DCCB tab"),
+  "only tabs the AI opened belong to a work space; the person's tab belongs to none",
+  await isControlledTab(10) && !(await isControlledTab(20)) && await ownerOf(20) === null
+    && (await listDccbTabs()).map(tab => tab.id).join() === "10,40",
 );
-check(
-  "explicit controlled tab is accepted by resolveTabId",
-  await resolveTabId(10) === 10,
-);
-// A new tab is only observed at creation time. Its (misreported) opener does
-// not grant ownership or trigger movement/deactivation until the browser's
-// sourceTabId proves that the controlled renderer opened it.
+
+// A new tab is only observed at creation time. Its (misreported) opener does not grant ownership or
+// trigger movement/deactivation until the browser's sourceTabId proves an AI tab opened it.
 await onCreated.emit({ ...tabsById.get(30) });
-await new Promise((resolve) => setTimeout(resolve, 0));
+await tick();
 check(
-  "new tab is untouched until source navigation confirms ownership",
-  tabsById.get(30)?.groupId === -1 && tabsById.get(30)?.active === true
-    && tabsById.get(30)?.windowId === 2 && grouped.every((entry) => !entry.ids.includes(30))
+  "a new tab is untouched until source navigation confirms it",
+  await ownerOf(30) === null && tabsById.get(30)?.active === true && tabsById.get(30)?.windowId === 2
     && moves.length === 0 && updates.length === 0 && windowUpdates.length === 0,
-  JSON.stringify({ popup: tabsById.get(30), grouped, moves, updates }),
+  JSON.stringify({ popup: tabsById.get(30), moves, updates }),
 );
-await onCreatedNavigationTarget.emit({ tabId: 30, sourceTabId: 10, sourceFrameId: 0,
-  url: "https://popup.test/", timeStamp: Date.now() });
-await new Promise((resolve) => setTimeout(resolve, 0));
+await onCreatedNavigationTarget.emit({ tabId: 30, sourceTabId: 10, sourceFrameId: 0, url: "https://popup.test/", timeStamp: Date.now() });
+await tick();
 check(
-  "sourceTabId adopts a child even when Chrome misreports openerTabId",
-  tabsById.get(30)?.groupId === 1 && tabsById.get(30)?.active === false
-    && tabsById.get(20)?.active === true && grouped.some((entry) => entry.ids.includes(30)),
-  JSON.stringify({ child: tabsById.get(30), human: tabsById.get(20), updates, grouped }),
+  "a page an AI tab opens joins its work space, inactive, without a tab group",
+  await ownerOf(30) === "default" && tabsById.get(30)?.active === false && tabsById.get(30)?.groupId === -1
+    && tabsById.get(20)?.active === true,
+  JSON.stringify({ child: tabsById.get(30), human: tabsById.get(20), updates }),
 );
 
-// Simulate a user's tab created during a controlled operation before the
-// target navigation attribution arrives. It must remain active and personal.
-tabsById.set(50, { id: 50, groupId: -1, windowId: 1, active: true, openerTabId: 20,
-  url: "https://child.test/", title: "Misreported opener child" });
+// A tab the person opens while the AI works stays theirs and stays in front.
+tabsById.set(50, { id: 50, groupId: -1, windowId: 1, active: true, openerTabId: 20, url: "https://child.test/", title: "Misreported opener child" });
 tabsById.get(20).active = false;
-const movesBeforeMisreportedChild = moves.length;
-const groupsBeforeMisreportedChild = grouped.length;
 await onCreated.emit({ ...tabsById.get(50) });
 await onActivated.emit({ tabId: 50, windowId: 1 });
-check("misreported-opener candidate has no pre-attribution side effects",
-  tabsById.get(50)?.groupId === -1 && tabsById.get(50)?.active === true
-    && moves.length === movesBeforeMisreportedChild && grouped.length === groupsBeforeMisreportedChild,
-  JSON.stringify({ child: tabsById.get(50), moves, grouped }));
-tabsById.set(60, { id: 60, groupId: -1, windowId: 1, active: true,
-  url: "https://user-created.test/", title: "User-created" });
+tabsById.set(60, { id: 60, groupId: -1, windowId: 1, active: true, url: "https://user-created.test/", title: "User-created" });
 tabsById.get(50).active = false;
 await onCreated.emit({ ...tabsById.get(60) });
 await onActivated.emit({ tabId: 60, windowId: 1 });
-await onCreatedNavigationTarget.emit({ tabId: 50, sourceTabId: 10, sourceFrameId: 0,
-  url: "https://child.test/", timeStamp: Date.now() });
-await new Promise((resolve) => setTimeout(resolve, 0));
+await onCreatedNavigationTarget.emit({ tabId: 50, sourceTabId: 10, sourceFrameId: 0, url: "https://child.test/", timeStamp: Date.now() });
+await tick();
 check(
-  "concurrent user-created tab stays active and outside DCCB while AI child is adopted",
-  tabsById.get(50)?.groupId === 1 && tabsById.get(50)?.active === false
-    && tabsById.get(60)?.groupId === -1 && tabsById.get(60)?.active === true
-    && tabsById.get(60)?.windowId === 1,
-  JSON.stringify({ child: tabsById.get(50), personal: tabsById.get(60), updates, grouped }),
+  "a tab the person opens meanwhile stays theirs and in front while the AI's child is adopted",
+  await ownerOf(50) === "default" && tabsById.get(50)?.active === false
+    && await ownerOf(60) === null && tabsById.get(60)?.active === true,
+  JSON.stringify({ child: tabsById.get(50), personal: tabsById.get(60), updates }),
 );
+await onCreatedNavigationTarget.emit({ tabId: 60, sourceTabId: 20, sourceFrameId: 0, url: "https://user-created.test/", timeStamp: Date.now() });
+await tick();
+check("a page the person's tab opens is never adopted", await ownerOf(60) === null);
 
-// An unconfirmed user window is likewise only observed. A page-sourced popup
-// is moved/grouped and its original focus restored only after webNavigation
-// identifies the controlled source tab.
-windowsById.set(3, { id: 3, focused: true, type: "normal" });
-windowsById.get(1).focused = false;
-await onWindowCreated.emit({ ...windowsById.get(3) });
-await onFocusChanged.emit(3);
-tabsById.set(61, { id: 61, groupId: -1, windowId: 3, active: true,
-  url: "https://personal-window.test/", title: "User window" });
-await onCreated.emit({ ...tabsById.get(61) });
-await onActivated.emit({ tabId: 61, windowId: 3 });
-check("user-created window receives no pre-attribution focus or tab changes",
-  tabsById.get(61)?.windowId === 3 && tabsById.get(61)?.active === true
-    && tabsById.get(61)?.groupId === -1 && windowsById.get(3)?.focused === true,
-  JSON.stringify({ tab: tabsById.get(61), windows: [...windowsById.values()], moves, windowUpdates }));
-
+// A window.open popup from an AI tab moves next to its source; the person's focus comes back.
 await chrome.windows.update(1, { focused: true });
 windowsById.set(4, { id: 4, focused: true, type: "popup" });
 windowsById.get(1).focused = false;
 await onWindowCreated.emit({ ...windowsById.get(4) });
 await onFocusChanged.emit(4);
-tabsById.set(70, { id: 70, groupId: -1, windowId: 4, active: true, openerTabId: 20,
-  url: "https://ai-popup.test/", title: "AI popup" });
+tabsById.set(70, { id: 70, groupId: -1, windowId: 4, active: true, openerTabId: 20, url: "https://ai-popup.test/", title: "AI popup" });
 await onCreated.emit({ ...tabsById.get(70) });
 await onActivated.emit({ tabId: 70, windowId: 4 });
-const movesBeforePopupAttribution = moves.length;
-const focusUpdatesBeforePopupAttribution = windowUpdates.length;
-check("AI popup is not moved or refocused before source signal",
-  tabsById.get(70)?.windowId === 4 && windowsById.get(4)?.focused === true
-    && moves.length === movesBeforePopupAttribution
-    && windowUpdates.length === focusUpdatesBeforePopupAttribution,
-  JSON.stringify({ tab: tabsById.get(70), windows: [...windowsById.values()], moves, windowUpdates }));
-await onCreatedNavigationTarget.emit({ tabId: 70, sourceTabId: 10, sourceFrameId: 0,
-  url: "https://ai-popup.test/", timeStamp: Date.now() });
-await new Promise((resolve) => setTimeout(resolve, 0));
-check("source-confirmed AI popup is grouped/inactive and restores prior window focus",
-  tabsById.get(70)?.groupId === 1 && tabsById.get(70)?.active === false
-    && tabsById.get(70)?.windowId === 1 && windowsById.get(1)?.focused === true,
-  JSON.stringify({ tab: tabsById.get(70), windows: [...windowsById.values()], moves, windowUpdates }));
-
-// The group's idle tab is reused (navigated, inactive) for the next AI tab instead of a new tab.
-tabsById.set(45, { id: 45, groupId: 1, windowId: 1, active: false, url: idleUrl(), title: "" });
-const reused = await createControlledTab("https://next.test/");
+await onCreatedNavigationTarget.emit({ tabId: 70, sourceTabId: 10, sourceFrameId: 0, url: "https://ai-popup.test/", timeStamp: Date.now() });
+await tick();
 check(
-  "the next AI tab reuses the idle tab",
-  reused.id === 45 && tabsById.get(45).url === "https://next.test/"
-    && creations.length === 0,
-  JSON.stringify({ reused, creations }),
+  "an AI popup window's tab moves next to its source, inactive, and the prior window keeps focus",
+  await ownerOf(70) === "default" && tabsById.get(70)?.active === false && tabsById.get(70)?.windowId === 1
+    && windowsById.get(1)?.focused === true,
+  JSON.stringify({ tab: tabsById.get(70), windows: [...windowsById.values()] }),
 );
-const fresh = await createControlledTab("https://another.test/");
+
+// New AI tabs: inactive, never grouped, next to the work space's other tabs or in the last focused
+// normal window; a second work space gets its own tabs in the same way.
+const research = await createControlledTab("https://research.test/", "research");
 check(
-  "with no idle tab a new AI tab opens inactive in the group",
-  creations.at(-1)?.properties.active === false && tabsById.get(fresh.id)?.groupId === 1,
+  "a work space's first tab opens inactive at the end of the last focused normal window",
+  creations.at(-1)?.properties.active === false && research.windowId === 1 && tabsById.get(research.id)?.groupId === -1
+    && await ownerOf(research.id) === "research",
   JSON.stringify(creations.at(-1)),
 );
-
-// One group for every work space (owner 11-08): two work spaces share the group, each sees only its
-// own tabs, and a work space group left by 1.2.0 is folded in.
-const groupCount = () => new Set([...tabsById.values()].map(tab => tab.groupId).filter(id => id > 0)).size;
-const research = await createControlledTab("https://research.test/", "research");
+windowsById.set(5, { id: 5, focused: true, type: "normal" });
+windowsById.get(1).focused = false;
+const second = await createControlledTab("https://research.test/2", "research");
+check("its next tab opens beside it, not in the window the person moved to", second.windowId === 1, JSON.stringify(second));
 const shopping = await createControlledTab("https://shopping.test/", "shopping");
 check(
-  "two work spaces share one AI group and each sees only its own tabs",
-  tabsById.get(research.id).groupId === tabsById.get(shopping.id).groupId && groupCount() === 1
-    && (await listDccbTabs("research")).map(tab => tab.id).join() === String(research.id)
-    && !(await isControlledTab(shopping.id, "research")) && await isControlledTab(shopping.id, "shopping"),
-  JSON.stringify({ research: tabsById.get(research.id), shopping: tabsById.get(shopping.id), groups: [...groups.values()] }),
+  "work spaces see only their own tabs",
+  shopping.windowId === 5
+    && (await listDccbTabs("research")).map(tab => tab.id).join() === `${research.id},${second.id}`
+    && (await listDccbTabs("shopping")).map(tab => tab.id).join() === String(shopping.id)
+    && !(await isControlledTab(shopping.id, "research")),
 );
-groups.set(7, { id: 7, title: "AI · 이 컴퓨터의 Chrome · youtube" });
-tabsById.set(80, { id: 80, groupId: 7, windowId: 1, active: false, url: "https://youtube.test/", title: "old" });
-tabsById.set(81, { id: 81, groupId: 7, windowId: 1, active: false, url: idleUrl(), title: "" });
-const youtube = await listDccbTabs("youtube");
-check(
-  "a 1.2.0 work space group is folded into the one group, keeping its tab's work space",
-  youtube.map(tab => tab.id).join() === "80" && groupCount() === 1
-    && [...tabsById.values()].filter(tab => tab.url === idleUrl()).length <= 1,
-  JSON.stringify({ youtube, tabs: [...tabsById.values()].filter(tab => tab.id >= 80) }),
-);
+await onRemoved.emit(shopping.id);
+tabsById.delete(shopping.id);
+check("a closed tab leaves its work space", (await listDccbTabs("shopping")).length === 0 && await ownerOf(shopping.id) === null);
 
-// With only 1.2.0 work space groups open, one of them is renamed into the AI group (no new group).
-for (const tab of [...tabsById.values()]) if (tab.groupId === 1) tabsById.delete(tab.id);
-groups.clear();
-stored.v8ClientGroups = {};
-groups.set(5, { id: 5, title: "AI · 이 컴퓨터의 Chrome · mail" });
-groups.set(6, { id: 6, title: "AI · 이 컴퓨터의 Chrome · docs" });
-tabsById.set(90, { id: 90, groupId: 5, windowId: 1, active: false, url: "https://mail.test/", title: "" });
-tabsById.set(91, { id: 91, groupId: 6, windowId: 1, active: false, url: "https://docs.test/", title: "" });
-const mail = await listDccbTabs("mail");
-const docs = await listDccbTabs("docs");
-check(
-  "1.2.0 work space groups become the one AI group by renaming and merging, no new group",
-  mail.map(tab => tab.id).join() === "90" && docs.map(tab => tab.id).join() === "91" && groupCount() === 1
-    && groups.get(5)?.title === "AI · 이 컴퓨터의 Chrome" && creations.every(c => !c.tab.url?.includes("mail")),
-  JSON.stringify({ mail, docs, groups: [...groups.values()], tabs: [...tabsById.values()].filter(tab => tab.id >= 90) }),
-);
+// With no normal window open (Chrome running in the background), one opens without taking focus.
+const savedWindows = new Map(windowsById);
+windowsById.clear();
+const lonely = await createControlledTab("https://alone.test/", "alone");
+check("with no browser window one opens unfocused for the AI tab", createdWindows.at(-1)?.focused === false && await ownerOf(lonely.id) === "alone");
+windowsById.clear();
+for (const [id, window] of savedWindows) windowsById.set(id, window);
 
-// With the dedicated AI window on, a group that is gone (its idle tab closed by an extension
-// reload) is rebuilt in the AI window that is still open, not in one more window (owner PC 11-07).
-const { connectionKey } = await import("../entrypoints/lib/v8-auth.ts");
-for (const tab of [...tabsById.values()]) if (tab.groupId === 1) tabsById.delete(tab.id);
-groups.clear();
-windowsById.set(9, { id: 9, focused: false, type: "normal" });
-stored.v8DedicatedWindow = true;
-stored.v8ClientWindows = { [connectionKey()]: 9 };
-stored.v8ClientGroups = {};
-const windowsBefore = windowsById.size;
-const inAiWindow = await createControlledTab("https://after-reload.test/");
+// The popup's card shows the last work space's working tab and brings it forward when pressed.
+windowsById.get(1).state = "minimized";
+setTargetTab(second.id, "research");
+const target = await popupTarget();
+const focused = await focusPopupTarget();
 check(
-  "a lost group is rebuilt in the open AI window, not a new window",
-  inAiWindow.windowId === 9 && windowsById.size === windowsBefore && creations.at(-1)?.properties.active === false,
-  JSON.stringify({ tab: inAiWindow, creation: creations.at(-1) }),
+  "the popup card's tab is the working tab and pressing it brings that tab forward",
+  target?.id === second.id && focused && tabsById.get(second.id)?.active === true
+    && windowsById.get(1)?.focused === true && windowUpdates.at(-1)?.changes.state === "normal",
+  JSON.stringify({ target, window: windowsById.get(1), last: windowUpdates.at(-1) }),
 );
+check("listAiTabs lists every AI tab with its work space", (await listAiTabs()).some(entry => entry.tab.id === research.id && entry.workspace === "research"));
 
-// The popup's "작업 탭으로 이동": a work space with no tab left falls back to another tab of the
-// group instead of showing Chrome's error; with no group at all it says so (F04b 11-08).
-windowsById.get(9).state = "minimized";
-const focusedFallback = await focusAnyGroupTab("shopping");
+// Leaving 1.2.x behind: its idle tab closes, the rest of its group is ungrouped, retired settings go.
+const idle = "chrome-extension://test/idle.html";
+tabsById.set(80, { id: 80, groupId: 9, windowId: 1, active: false, url: idle, title: "" });
+tabsById.set(81, { id: 81, groupId: 9, windowId: 1, active: false, url: "https://left.test/", title: "left" });
+tabsById.set(82, { id: 82, groupId: 7, windowId: 1, active: false, url: "https://stored.test/", title: "stored group" });
+tabsById.set(83, { id: 83, groupId: 6, windowId: 1, active: false, url: "https://person-group.test/", title: "the person's own group" });
+Object.assign(stored, { v8ClientGroups: { key: 7 }, v8DedicatedWindow: true, v8BrowserBridgeHandoff: true });
+await migrateFromTabGroups();
 check(
-  "the popup shows another AI tab when the last work space has none",
-  focusedFallback === true && tabsById.get(inAiWindow.id).active === true && windowsById.get(9).focused === true,
-  JSON.stringify({ focusedFallback, tab: tabsById.get(inAiWindow.id), window: windowsById.get(9) }),
+  "1.2.x's idle tab closes and its groups are ungrouped; the person's own group stays",
+  !tabsById.has(80) && tabsById.get(81)?.groupId === -1 && tabsById.get(82)?.groupId === -1 && tabsById.get(83)?.groupId === 6
+    && stored.v8ClientGroups === undefined && stored.v8DedicatedWindow === undefined && stored.v8BrowserBridgeHandoff === undefined,
+  JSON.stringify({ ungrouped, removed, stored }),
 );
-for (const tab of [...tabsById.values()]) if (tab.groupId > 0) tabsById.delete(tab.id);
-groups.clear();
-stored.v8ClientGroups = {};
-const groupsBeforeEmptyFocus = groups.size;
-check(
-  "with no AI group the popup is told there is no AI tab, and no group is made",
-  await focusAnyGroupTab("shopping") === false && groups.size === groupsBeforeEmptyFocus,
-);
+tabsById.set(84, { id: 84, groupId: 9, windowId: 1, active: false, url: idle, title: "" });
+await migrateFromTabGroups();
+check("the migration runs once", tabsById.has(84));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) {

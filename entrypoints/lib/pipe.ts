@@ -19,9 +19,9 @@
 //   the four forwarded events, extension.initialized).
 // Modified by DCCB (2026-11-06) — Browser Bridge 1.1.0 pipe:
 //   - frames ride Browser Bridge's relay WebSocket as pipe_* messages, one channel per engine;
-//   - a channel owns one work space's tab group (lib/target.ts) and may attach only to its tabs
-//     (the original accepts any tabId); the group and its idle tab are reused, never a new tab per
-//     connection (owner 11-06);
+//   - a channel may attach only to the tabs the AI opened for its work space (lib/target.ts; the
+//     original accepts any tabId); an engine that reconnects after a dropped socket gets those tabs
+//     back instead of a new one (owner 11-06), and they close when the engine leaves (6.0.0);
 //   - attach goes through lib/cdp.ts: focus emulation, the mute guard, Bridge on/off;
 //   - Input.* goes through cdp.sendInput (Claude in Chrome's draw-if-held, 5 s acknowledgement:
 //     an unacknowledged input is an error, never a silent "done");
@@ -31,7 +31,7 @@
 //     leaves Page.captureScreenshot unanswered, so each click cost 3 × 2 s (owner PC 11-07).
 
 import * as cdp from "./cdp";
-import { createControlledTab, forgetTabOwner, idleUrl, isControlledTab, listDccbTabs, listGroupTabs, normalizeWorkspace } from "./target";
+import { createControlledTab, isControlledTab, listAiTabs, listDccbTabs, normalizeWorkspace } from "./target";
 import type { PipeCommand, PipeEvent, PipeResponse } from "../../shared/protocol";
 
 type Send = (frame: PipeResponse | PipeEvent) => void;
@@ -40,20 +40,16 @@ interface Channel {
   workspace: string;
   /** Tabs this channel attached to; events of only these tabs are forwarded. */
   attached: Set<number>;
-  /** Tabs announced to the engine (the group's tabs plus tabs it created or that they opened). */
+  /** Tabs announced to the engine (the work space's tabs plus tabs it created or that they opened). */
   known: Set<number>;
   /** Tabs where the engine runs its own screencast. */
   screencasts: Set<number>;
 }
 
-/** The status line in the popup: the last pipe failure a person should see (null once things work). */
-export interface PipeProblem { message: string; at: number }
-
 const channels = new Map<string, Channel>();
 let send: Send = () => {};
-let problem: PipeProblem | null = null;
-let onProblemChange: () => void = () => {};
-/** Why Chrome refuses AI work right now (Bridge off, the person is working), or null. */
+let onChange: () => void = () => {};
+/** Why Chrome refuses AI work right now (not enrolled), or null. */
 let refusal: () => string | null = () => null;
 /** Tabs whose screenshot fallback is running: their screencast frames are ours, not the engine's. */
 const screencastOwners = new Map<number, (data: string, sessionId: number) => void>();
@@ -62,15 +58,34 @@ const CAPTURE_WAIT_MS = 1_500;
 const SCREENCAST_WAIT_MS = 8_000;
 const DRAW_FRAME_WAIT_MS = 2_000;
 
-function setProblem(message: string | null): void {
-  const next = message === null ? null : { message, at: Date.now() };
-  if (problem?.message === next?.message) return;
-  problem = next;
-  onProblemChange();
+/**
+ * A work space's tabs close this long after its last engine went away (6.0.0): the AI is told to
+ * close them when it is done, and this covers the time it does not. Kept in session storage so a
+ * service worker restart keeps the clock.
+ */
+export const IDLE_CLOSE_MS = 10 * 60_000;
+const LAST_USE_KEY = "v8WorkspaceLastUse";
+async function touchWorkspace(workspace: string): Promise<void> {
+  const stored = ((await chrome.storage.session.get(LAST_USE_KEY))[LAST_USE_KEY] ?? {}) as Record<string, number>;
+  stored[workspace] = Date.now();
+  await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
 }
 
-export function pipeProblem(): PipeProblem | null {
-  return problem;
+/** Close the AI tabs of every work space no engine has used for IDLE_CLOSE_MS. */
+export async function closeIdleAiTabs(now = Date.now()): Promise<number[]> {
+  const stored = ((await chrome.storage.session.get(LAST_USE_KEY))[LAST_USE_KEY] ?? {}) as Record<string, number>;
+  const busy = new Set([...channels.values()].map(entry => entry.workspace));
+  const closing: number[] = [];
+  let changed = false;
+  for (const { tab, workspace } of await listAiTabs()) {
+    if (busy.has(workspace)) continue;
+    // A tab from before this clock started (a service worker that lost it) waits a full period.
+    if (stored[workspace] === undefined) { stored[workspace] = now; changed = true; continue; }
+    if (now - stored[workspace] >= IDLE_CLOSE_MS && tab.id !== undefined) closing.push(tab.id);
+  }
+  if (changed) await chrome.storage.session.set({ [LAST_USE_KEY]: stored });
+  if (closing.length) await chrome.tabs.remove(closing).catch(error => console.log("[bb pipe] idle close failed", String(error)));
+  return closing;
 }
 
 export function pipeChannelCount(): number {
@@ -83,7 +98,7 @@ function tabForWire(tab: chrome.tabs.Tab) {
 
 function debuggable(tab: chrome.tabs.Tab): boolean {
   const url = tab.url ?? tab.pendingUrl ?? "";
-  return tab.id !== undefined && url !== idleUrl() && !/^(chrome|chrome-extension|devtools|edge):/i.test(url);
+  return tab.id !== undefined && !/^(chrome|chrome-extension|devtools|edge):/i.test(url);
 }
 
 function event(channel: string, method: string, params: unknown[]): void {
@@ -91,9 +106,9 @@ function event(channel: string, method: string, params: unknown[]): void {
 }
 
 /** Install the chrome.* listeners once; `sendFrame` writes to the relay socket. */
-export function installPipe(sendFrame: Send, problemChanged: () => void, refuse: () => string | null): void {
+export function installPipe(sendFrame: Send, changed: () => void, refuse: () => string | null): void {
   send = sendFrame;
-  onProblemChange = problemChanged;
+  onChange = changed;
   refusal = refuse;
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (source.tabId === undefined) return;
@@ -114,7 +129,6 @@ export function installPipe(sendFrame: Send, problemChanged: () => void, refuse:
     for (const [id, channel] of channels) {
       if (!channel.attached.delete(source.tabId)) continue;
       event(id, "chrome.debugger.onDetach", [source, reason]);
-      if (reason === "canceled_by_user") setProblem("디버깅 표시줄에서 취소를 눌러 AI 작업이 멈췄습니다. 다시 하려면 AI에게 이어서 하라고 말하세요.");
     }
   });
   chrome.tabs.onCreated.addListener(tab => {
@@ -135,7 +149,7 @@ export function installPipe(sendFrame: Send, problemChanged: () => void, refuse:
   });
 }
 
-/** Open a channel: announce the work space's tabs, reusing the group (and its idle tab) before opening one. */
+/** Open a channel: announce the work space's tabs, opening one background tab only when it has none. */
 export async function openPipe(channel: string, workspaceValue: string): Promise<void> {
   try {
     const refused = refusal();
@@ -150,7 +164,8 @@ export async function openPipe(channel: string, workspaceValue: string): Promise
       event(channel, "chrome.tabs.onCreated", [tabForWire(tab)]);
     }
     event(channel, "extension.initialized", []);
-    setProblem(null);
+    await touchWorkspace(workspace);
+    onChange();
   } catch (error) {
     channels.delete(channel);
     const message = error instanceof Error ? error.message : String(error);
@@ -167,13 +182,25 @@ export function closePipe(channel: string): void {
   const entry = channels.get(channel);
   if (!entry) return;
   channels.delete(channel);
-  // Leave the debugger attached: the Bridge tools and the next engine reuse it, and the work
-  // space's tabs stay in their group for the next connection.
+  // The engine left (`pc-browser close`, or its daemon ended): the AI is done with this work space,
+  // so its tabs close (owner 11-08). agent-browser only disconnects on close; it sends no
+  // Browser.close to a browser it did not launch. A dropped relay socket is not this (closeAllPipes).
+  if ([...channels.values()].some(other => other.workspace === entry.workspace)) return;
+  void listDccbTabs(entry.workspace)
+    .then(tabs => tabs.length ? chrome.tabs.remove(tabs.map(tab => tab.id!)) : undefined)
+    .catch(error => console.log("[bb pipe] closing the work space's tabs failed", String(error)))
+    .then(() => touchWorkspace(entry.workspace))
+    .then(onChange);
 }
 
-/** The relay socket closed: every engine is gone. */
+/**
+ * The relay socket closed (relay restart, network, service worker): the engines may come back, so
+ * the tabs stay; closeIdleAiTabs closes them if none does.
+ */
 export function closeAllPipes(): void {
+  const workspaces = new Set([...channels.values()].map(entry => entry.workspace));
   channels.clear();
+  void Promise.all([...workspaces].map(touchWorkspace)).then(onChange);
 }
 
 async function owned(entry: Channel, tabId: unknown): Promise<number> {
@@ -182,7 +209,7 @@ async function owned(entry: Channel, tabId: unknown): Promise<number> {
     entry.known.add(tabId);
     return tabId;
   }
-  throw new Error(`tab ${tabId} is not in this AI work space; only tabs in the "${entry.workspace}" group can be driven`);
+  throw new Error(`tab ${tabId} is not in this AI work space; only tabs the AI opened for "${entry.workspace}" can be driven`);
 }
 
 /**
@@ -247,7 +274,6 @@ async function captureScreenshot(tabId: number, params: Record<string, unknown>)
   await cdp.send(tabId, "Page.startScreencast", { format, ...(format === "jpeg" ? { quality: Number(params.quality ?? 80) } : {}), everyNthFrame: 1 });
   try {
     const data = await frame;
-    setProblem(null);
     return { data };
   } catch (error) {
     // The AI gets this error and retries; nothing for the person to do.
@@ -292,22 +318,7 @@ async function run(channelId: string, entry: Channel, method: string, params: un
     case "chrome.tabs.remove": {
       const ids = [params[0]].flat();
       for (const id of ids) await owned(entry, id);
-      const removed = new Set<number>();
-      for (const id of ids as number[]) {
-        // Other work spaces' tabs keep the one group open too; only the group's very last tab idles.
-        const others = (await listGroupTabs()).filter(tab => tab.id !== id && !removed.has(tab.id!) && tab.url !== idleUrl());
-        removed.add(id);
-        if (others.length > 0) {
-          await chrome.tabs.remove(id);
-          continue;
-        }
-        // The group's last tab stays as the idle tab, so the group (and the next connection) reuses it.
-        entry.attached.delete(id);
-        entry.known.delete(id);
-        await forgetTabOwner(id);
-        await chrome.tabs.update(id, { url: idleUrl() });
-        event(channelId, "chrome.tabs.onRemoved", [id, { windowId: -1, isWindowClosing: false }]);
-      }
+      await chrome.tabs.remove(ids as number[]);
       return {};
     }
   }

@@ -4,8 +4,8 @@
  *   ws://127.0.0.1:<HTTP port>/cdp/<workspace>[?target=<browserId>]
  *
  * agent-browser (`pc-browser`) connects here with `--cdp`. Each connection is one PipeSession and
- * one channel on the chosen browser's relay WebSocket; the extension keeps one tab group per work
- * space, so a work space has at most one engine at a time. Only this relay's own Linux account may
+ * one channel on the chosen browser's relay WebSocket; the extension keeps each work space's tabs
+ * apart, and a work space has at most one engine at a time. Only this relay's own Linux account may
  * connect (the same loopback peer check as the HTTP control routes, 1.0.9).
  */
 import { randomUUID } from "node:crypto";

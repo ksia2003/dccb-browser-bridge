@@ -6,12 +6,12 @@
 
 ## 구조
 - `entrypoints/` — 확장(WXT MV3)
-  - `background.ts`: relay WS, 등록(v8), keepalive, 팝업 메시지, 사람에게 넘기기(HOLD)
-  - `lib/pipe.ts`: 통로. Playwright 확장 protocol v2 + DCCB 몫(작업 공간 그룹의 탭만, 뒤 탭 입력 전 그리기, 가려진·최소화 창 스크린샷)
-  - `lib/target.ts`: 크롬마다 "AI · 기기" 탭 그룹 하나(작업 공간은 그 안에서 탭 주인만 따로), 대기 탭(`idle.html`), AI 전용 창, 새 탭 편입
+  - `background.ts`: relay WS, 등록(v8), keepalive, 팝업 상태, 알람(재연결·남은 AI 탭 닫기)
+  - `lib/pipe.ts`: 통로. Playwright 확장 protocol v2 + DCCB 몫(작업 공간이 연 탭만, 뒤 탭 입력 전 그리기, 가려진·최소화 창 스크린샷, 엔진이 떠나면 탭 닫기)
+  - `lib/target.ts`: AI 탭(그룹 없는 뒤쪽 탭, 작업 공간별 주인 기록), AI 탭이 연 새 탭 편입, 1.2.x 그룹 정리
   - `lib/cdp.ts`: attach(초점 에뮬레이션·음소거 가드), 입력·그리기
-  - `lib/tools/`: 확장이 직접 하는 도구 넷 — `fetch`(탭 없이 사람 쿠키로 요청), `handoff`, `notify`, `extension`(version·reload)
-  - `popup/`: 연결·켜기/끄기·AI 작업 탭 보기·AI 전용 창·사람에게 넘기기·통로 문제 줄
+  - `lib/tools/`: 확장이 직접 하는 도구 둘 — `fetch`(탭 없이 사람 쿠키로 요청), `extension`(version·reload)
+  - `popup/`: 상태만 보여 주는 팝업(연결 전·연결됨·AI 작업 중·재연결 중, 라이트/다크). 작업 중 카드를 누르면 그 탭으로
 - `server/` — Node relay(tsx)
   - `index.ts`: 확장 WS, HOME 제어 HTTP(`/send`·`/browsers`·`/api/enroll/*`·`/api/auth/refresh`), `/cdp/<작업 공간>` CDP 끝점
   - `pipe/`: Playwright cdpRelay·browserModel 이식 + agent-browser 탭 찾기 흉내, 한 작업 공간에 엔진 하나
@@ -34,7 +34,7 @@ relay는 시작할 때 토큰 파일 옆에 `http-control.secret`(0600)을 만�
 
 ## 사람 크롬의 AI 탭
 
-AI 탭은 "AI · 기기" 그룹 하나 안에서 비활성으로 열리고 앞으로 오지 않는다(`Page.bringToFront`·`Target.activateTarget`은 relay가 삼킨다). 작업 공간이 여럿이어도 그룹은 하나다(크롬이 그룹마다 북마크줄에 이름표를 달기 때문, 11-08). 다시 연결해도 그 작업 공간의 탭을 다시 쓰고, 없을 때만(대기 탭이 있으면 그것을) 하나 연다. 마지막 탭을 닫으면 그 탭이 대기 탭(`idle.html`)으로 남아 그룹이 닫히지 않는다. 확장을 다시 불러오거나 업데이트하면 크롬이 대기 탭을 닫아 대기 탭만 있던 그룹은 사라지지만, 저장되지 않고 다음 연결이 그룹을 하나 새로 만든다(owner PC 11-07, 3회). `target=_blank`·`window.open` 자식은 `webNavigation.onCreatedNavigationTarget`의 `sourceTabId`가 AI 탭으로 확인된 뒤에만 그룹에 들어온다. 사람이 AI 탭을 보려면 팝업의 **AI 작업 탭 보기**를 누른다.
+AI 탭은 그룹 없이 사람 창의 뒤쪽 탭으로 열리고 앞으로 오지 않는다(`Page.bringToFront`·`Target.activateTarget`은 relay가 삼킨다). 크롬은 탭 그룹을 모두 북마크줄 "저장된 탭 그룹"에 올리고 창을 닫아도 남겨 두기 때문에 그룹을 쓰지 않는다(owner 11-08). 엔진이 떠나면(`pc-browser close`) 그 작업 공간의 탭이 닫히고, relay 연결이 끊겨 엔진이 돌아오지 않으면 10분 뒤에 닫힌다. `target=_blank`·`window.open` 자식은 `webNavigation.onCreatedNavigationTarget`의 `sourceTabId`가 AI 탭으로 확인된 뒤에만 그 작업 공간에 들어온다. 사람은 팝업의 작업 중 카드를 눌러 AI 탭으로 간다. 로그인·캡차처럼 사람이 할 일은 AI가 채팅으로 부탁한다.
 
 ## PC 네트워크 fetch
 
