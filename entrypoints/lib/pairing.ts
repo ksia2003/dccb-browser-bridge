@@ -1,4 +1,4 @@
-/** Setting up from one paste of the dashboard's address and code (6.0.0). */
+/** The dashboard's address and code from one paste into either setup field (6.0.0). */
 
 /**
  * The dashboard shows the address and the code together; take both from one paste (any order,

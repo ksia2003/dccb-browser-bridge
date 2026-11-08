@@ -282,6 +282,8 @@ async function popupSnapshot() {
     latestExtensionVersion,
     working,
     page: tab ? { title: tab.title ?? "", url: tab.url ?? "", favIconUrl: tab.favIconUrl ?? null } : null,
+    // The person can limit the extension's site access in Chrome; only they can open it again.
+    siteAccess: await chrome.permissions.contains({ origins: ["<all_urls>"] }).catch(() => true),
   };
 }
 

@@ -33,7 +33,7 @@ import {
   type IssuedSetupCode,
   type RedeemedSetupCode,
 } from "./enrollment.js";
-import { isChromeExtensionOrigin } from "./origin.js";
+import { allowExtensionOrigin, isChromeExtensionOrigin } from "./origin.js";
 import { loopbackPeerUid, uidOfUser } from "./peer-uid.js";
 
 export interface PublicDoorRoute extends BrowserBridgeRouteBinding {
@@ -235,6 +235,7 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
   });
 
   const publicServer = createServer((req, res) => {
+    if (req.url === "/api/enroll/redeem" || req.url === "/api/auth/refresh") allowExtensionOrigin(req, res);
     if (req.method === "OPTIONS") { json(res, 204, {}); return; }
     if (req.method === "POST" && req.url === "/api/enroll/redeem") {
       void (async () => {

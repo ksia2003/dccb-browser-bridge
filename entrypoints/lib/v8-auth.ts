@@ -192,6 +192,9 @@ export async function init(nextHooks: AuthHooks): Promise<void> {
   hooks.openSocket();
 }
 
+const SETUP_ATTEMPTS = 3;
+const SETUP_RETRY_MS = 1_000;
+
 /** Redeem the dashboard's short-lived code immediately; V8 never asks an AI to approve it. */
 export async function setup(address: string, setupCode: string): Promise<void> {
   let origin: string;
@@ -208,15 +211,23 @@ export async function setup(address: string, setupCode: string): Promise<void> {
   const browserId = await stableBrowserId();
   error = null;
   setState("connecting");
-  let response: Response;
-  try {
-    response = await fetch(new URL("/api/enroll/redeem", origin), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ setup_code: code, stable_browser_id: browserId }),
-    });
-  } catch {
-    error = "주소에 연결할 수 없습니다";
+  // A network hiccup (Wi-Fi, a VPN reconnecting) should not make the person paste again: try a few
+  // times before saying the address cannot be reached, and keep the reason in the worker's log.
+  let response: Response | undefined;
+  for (let attempt = 0; attempt < SETUP_ATTEMPTS && !response; attempt++) {
+    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, SETUP_RETRY_MS * attempt));
+    try {
+      response = await fetch(new URL("/api/enroll/redeem", origin), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setup_code: code, stable_browser_id: browserId }),
+      });
+    } catch (cause) {
+      console.log("[bb auth] enrollment request failed", { origin, attempt: attempt + 1, reason: cause instanceof Error ? cause.message : String(cause) });
+    }
+  }
+  if (!response) {
+    error = "주소에 연결할 수 없습니다. 주소가 맞는지, 이 PC가 서버에 접속할 수 있는지(예: Tailscale) 확인해 주세요";
     setState("address_error");
     return;
   }

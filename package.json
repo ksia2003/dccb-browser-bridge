@@ -12,7 +12,7 @@
     "genkey": "node scripts/genkey.mjs",
     "server": "tsx server/index.ts",
     "typecheck": "tsc --noEmit",
-    "test:unit": "tsx test/peer-uid.unit.mjs && tsx test/target.unit.test.mjs && tsx test/tab-lifecycle.unit.mjs && tsx test/pairing.unit.mjs && tsx test/enrollment.unit.mjs && tsx test/public-door.unit.mjs && tsx test/public-door.integration.mjs && tsx test/http-handler.unit.mjs && tsx test/cdp-lifecycle.unit.mjs && tsx test/v8-profile.unit.mjs && node test/relay-release.unit.mjs && tsx test/fetch-tool.unit.mjs && node test/http-control.integration.mjs && node test/ws-origin.integration.mjs && node test/duplicate-browsers.integration.mjs && tsx test/pipe.unit.mjs",
+    "test:unit": "tsx test/peer-uid.unit.mjs && tsx test/target.unit.test.mjs && tsx test/tab-lifecycle.unit.mjs && tsx test/pairing.unit.mjs && tsx test/enrollment.unit.mjs && tsx test/public-door.unit.mjs && tsx test/public-door.integration.mjs && tsx test/http-handler.unit.mjs && tsx test/cdp-lifecycle.unit.mjs && tsx test/v8-profile.unit.mjs && node test/relay-release.unit.mjs && tsx test/fetch-tool.unit.mjs && node test/http-control.integration.mjs && node test/ws-origin.integration.mjs && node test/duplicate-browsers.integration.mjs && node test/extension-cors.integration.mjs && tsx test/pipe.unit.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

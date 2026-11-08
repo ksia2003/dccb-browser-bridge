@@ -9,7 +9,7 @@
   - `background.ts`: relay WS, 등록(v8), keepalive, 팝업 상태, 알람(재연결·남은 AI 탭 닫기)
   - `lib/pipe.ts`: 통로. Playwright 확장 protocol v2 + DCCB 몫(작업 공간이 연 탭만, 뒤 탭 입력 전 그리기, 가려진·최소화 창 스크린샷, 끝난 작업의 탭 닫기)
   - `lib/target.ts`: AI 탭(그룹 없는 뒤쪽 탭, 음소거, 작업 공간별 주인과 사람이 본 탭 기록), AI 탭이 연 새 탭 편입, 1.2.x 그룹 정리
-  - `lib/pairing.ts`: 대시보드의 주소와 코드를 한 번 붙여 넣은 글에서 읽기
+  - `lib/pairing.ts`: 대시보드의 주소와 코드를 함께 붙여 넣으면 두 칸으로 나누기
   - `lib/cdp.ts`: attach(초점 에뮬레이션·음소거 가드), 입력·그리기
   - `lib/tools/`: 확장이 직접 하는 도구 셋 — `fetch`(탭 없이 사람 쿠키로 요청), `close`(작업 공간의 탭 닫기), `extension`(version·reload)
   - `popup/`: 상태만 보여 주는 팝업(연결 전·연결됨·AI 작업 중·재연결 중, 라이트/다크). 페이지 카드를 누르면 그 탭으로. `?welcome=1`은 새로 설치했을 때 열리는 연결 페이지

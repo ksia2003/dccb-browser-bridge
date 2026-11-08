@@ -11,6 +11,7 @@ interface PopupSnapshot {
   latestExtensionVersion: string | null;
   working: boolean;
   page: { title: string; url: string; favIconUrl: string | null } | null;
+  siteAccess: boolean;
 }
 type Request =
   | { type: "getState" | "reset" | "focusTarget" }
@@ -20,7 +21,8 @@ type Request =
 // A Web Store install carries update_url and Chrome updates it by itself; an unpacked copy does not.
 const fromStore = Boolean((chrome.runtime.getManifest() as { update_url?: string }).update_url);
 
-const pair = byId<HTMLTextAreaElement>("pair");
+const address = byId<HTMLInputElement>("address");
+const code = byId<HTMLInputElement>("code");
 // The setup page a fresh install opens: the same card, centred, with the pin hint.
 const welcome = new URLSearchParams(location.search).has("welcome");
 if (welcome) document.documentElement.classList.add("page");
@@ -49,6 +51,7 @@ function render(s: PopupSnapshot): void {
   setupError.textContent = error ?? "";
   byId<HTMLButtonElement>("connect").disabled = pending;
   byId("pin-hint").hidden = !welcome;
+  byId("site-access").hidden = setup || s.siteAccess;
   byId("welcome-done").hidden = !(welcome && s.state === "connected");
 
   const look = s.working ? { cls: "busy", icon: "#spark", title: "AI가 작업 중", desc: "내 탭은 그대로 둡니다." }
@@ -105,21 +108,30 @@ function closeMenu(): void {
 }
 
 function connect(): void {
-  const { address, code } = parsePairing(pair.value);
   const setupError = byId("setup-error");
-  if (!address || !code) {
+  if (!address.value.trim() || !code.value.trim()) {
     setupError.hidden = false;
-    setupError.textContent = !address && !code ? "대시보드의 주소와 코드를 붙여 넣어 주세요." : !address ? "주소(https://…)도 같이 붙여 넣어 주세요." : "8자리 코드도 같이 붙여 넣어 주세요.";
+    setupError.textContent = !address.value.trim() ? "대시보드의 주소를 넣어 주세요." : "대시보드의 8자리 코드를 넣어 주세요.";
     return;
   }
   pending = true;
   byId<HTMLButtonElement>("connect").disabled = true;
-  void ask({ type: "setup", address, code }).finally(() => { pending = false; byId<HTMLButtonElement>("connect").disabled = false; });
+  void ask({ type: "setup", address: address.value.trim(), code: code.value }).finally(() => { pending = false; byId<HTMLButtonElement>("connect").disabled = false; });
 }
 byId("setup-form").addEventListener("submit", event => { event.preventDefault(); connect(); });
-pair.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); connect(); } });
-// A paste that already has both connects at once.
-pair.addEventListener("paste", () => setTimeout(() => { const { address, code } = parsePairing(pair.value); if (address && code) connect(); }, 0));
+code.addEventListener("input", () => { code.value = code.value.toUpperCase().replace(/[^A-Z2-9]/g, "").slice(0, 8); });
+// Pasting the dashboard's address and code together into either field fills both.
+for (const field of [address, code]) {
+  field.addEventListener("paste", event => {
+    const { address: pastedAddress, code: pastedCode } = parsePairing(event.clipboardData?.getData("text") ?? "");
+    if (!pastedAddress && !pastedCode) return;
+    if (field === address && !pastedAddress) return;
+    event.preventDefault();
+    if (pastedAddress) address.value = pastedAddress;
+    if (pastedCode) code.value = pastedCode;
+    if (address.value && code.value.length === 8) connect();
+  });
+}
 byId("card").addEventListener("click", () => void ask({ type: "focusTarget" }).then(() => { if (!welcome) window.close(); }));
 more.addEventListener("click", () => {
   const open = menu.hidden;

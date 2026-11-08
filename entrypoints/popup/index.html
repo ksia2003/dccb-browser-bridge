@@ -51,8 +51,8 @@
     .card .go{color:var(--fg-3);flex:none}
     .form{padding:0 16px 16px}
     .form label{display:block;font-size:12px;font-weight:600;color:var(--fg-2);margin:12px 0 6px}
-    .form textarea{display:block;width:100%;border-radius:8px;border:1px solid var(--line);background:var(--bg-2);padding:10px 12px;font-size:14px;line-height:20px;resize:none}
-    .form textarea:focus{outline:2px solid var(--brand);outline-offset:-1px;background:var(--bg)}
+    .form input{display:block;width:100%;height:40px;border-radius:8px;border:1px solid var(--line);background:var(--bg-2);padding:0 12px;font-size:14px}
+    .form input:focus{outline:2px solid var(--brand);outline-offset:-1px;background:var(--bg)}
     .primary{width:100%;height:40px;margin-top:16px;border:0;border-radius:8px;background:var(--brand);color:#fff;font-size:14px;font-weight:700;cursor:pointer}
     .primary:disabled{opacity:.6;cursor:default}
     .error{color:var(--danger);font-size:12px;line-height:16px;margin:8px 0 0}
@@ -97,8 +97,8 @@
       <p class="desc">DCCB 대시보드의 주소와 코드를 넣으면<br>이후로는 알아서 연결됩니다.</p>
     </div>
     <form class="form" id="setup-form">
-      <label for="pair">연결 정보</label>
-      <textarea id="pair" rows="3" placeholder="대시보드의 주소와 코드를 한 번에 복사해 붙여 넣으세요" autocomplete="off" spellcheck="false"></textarea>
+      <label for="address">주소</label><input id="address" type="url" placeholder="https://…" autocomplete="off" spellcheck="false">
+      <label for="code">코드</label><input id="code" type="text" placeholder="Q7M2 K9TX" autocomplete="off" spellcheck="false">
       <p class="error" id="setup-error" hidden></p>
       <button class="primary" id="connect" type="submit">연결</button>
     </form>
@@ -117,6 +117,7 @@
       <svg class="go" width="16" height="16"><use href="#chev"/></svg>
     </button>
     <p class="notice" id="update" hidden></p>
+    <p class="notice" id="site-access" hidden><b>사이트 액세스가 제한돼 있어요</b><br>AI가 일부 사이트에서 일하지 못할 수 있습니다. <code>chrome://extensions</code> → Browser Bridge 세부정보 → 사이트 액세스를 "모든 사이트에서"로 바꿔 주세요.</p>
     <p class="notice" id="welcome-done" hidden>연결됐습니다. 이 탭은 닫아도 됩니다.</p>
   </section>
 

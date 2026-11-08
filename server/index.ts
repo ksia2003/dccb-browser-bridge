@@ -43,7 +43,7 @@ import {
 } from "./auth.js";
 import { createPipeEndpoint } from "./pipe/endpoint.js";
 import { runHttpHandler } from "./http-handler.js";
-import { isChromeExtensionOrigin } from "./origin.js";
+import { allowExtensionOrigin, isChromeExtensionOrigin } from "./origin.js";
 import {
   BrowserBridgeEnrollmentStore,
   routeFromEnvironment,
@@ -617,9 +617,10 @@ const handleHttpRequest = (req: IncomingMessage, res: ServerResponse) => {
   // Current extensions perform these two capability-authenticated bootstrap
   // calls directly against their configured HOME/public origin. Every local
   // control, issuer, legacy auth, and unknown HTTP route requires this HOME's
-  // secret; no response grants browser-page CORS access.
+  // secret. Only these two answer CORS, and only to a chrome-extension:// origin (origin.ts).
   const extensionHttpCallback = (req.method === "POST" || req.method === "OPTIONS")
     && (req.url === "/api/enroll/redeem" || req.url === "/api/auth/refresh");
+  if (extensionHttpCallback) allowExtensionOrigin(req, res);
   if (req.method === "OPTIONS") {
     if (!extensionHttpCallback && !requireLocalControl(req, res)) return;
     writeJson(res, 204, {});
@@ -827,9 +828,11 @@ async function handleEnrollmentRedeem(req: IncomingMessage, res: ServerResponse)
   if (!result.ok) {
     const status = result.error === "expired_code" || result.error === "used_code" ? 400
       : result.error === "route_unavailable" ? 503 : 409;
+    log(`enrollment refused: ${result.error}`);
     writeJson(res, status, { error: result.error });
     return;
   }
+  log("enrollment redeemed");
   const route = result.value!;
   const bearer = issueEnrollmentTokens(`v8-${route.person}-${route.browserId}`, {
     person: route.person, boxId: route.boxId, relayBinding: route.relayBinding,
