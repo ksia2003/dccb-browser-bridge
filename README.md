@@ -2,7 +2,7 @@
 
 사람의 Chrome을 HOME의 AI가 다루게 잇는 MV3 확장과 relay. 1.2.0부터 확장은 **얇은 chrome.debugger
 통로(pipe)** 이고, 페이지 작업은 HOME의 agent-browser가 한다(DCCB `pc-browser`). Playwright에서 옮긴
-코드와 고지는 `NOTICE`. 바뀐 내용은 `CHANGELOG.md`.
+코드와 고지는 `NOTICE`. 바뀐 내용은 `CHANGELOG.md`, 개인정보 처리방침은 [`PRIVACY.md`](PRIVACY.md).
 
 ## 구조
 - `entrypoints/` — 확장(WXT MV3)
