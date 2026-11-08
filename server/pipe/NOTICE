@@ -1,0 +1,20 @@
+DCCB Browser Bridge
+
+This product includes software derived from Playwright
+(https://github.com/microsoft/playwright), Copyright (c) Microsoft Corporation,
+licensed under the Apache License, Version 2.0. Playwright's own NOTICE:
+
+  Playwright
+  Copyright (c) Microsoft Corporation
+
+  This software contains code derived from the Puppeteer project (https://github.com/puppeteer/puppeteer),
+  available under the Apache 2.0 license (https://github.com/puppeteer/puppeteer/blob/master/LICENSE).
+
+Derived files (source commit 1af60d94ac714d4007828bafa02b0f1cbd8646b9, modified as noted in each file):
+  server/pipe/protocol.ts      ← packages/playwright-core/src/tools/mcp/protocol.ts
+  server/pipe/browserModel.ts  ← packages/playwright-core/src/tools/mcp/browserModel.ts
+  server/pipe/session.ts       ← packages/playwright-core/src/tools/mcp/cdpRelay.ts, cdpRelayV2.ts
+  entrypoints/lib/pipe.ts      ← packages/extension/src/relayConnection.ts
+
+The Apache License 2.0 text is in server/pipe/LICENSE-Apache-2.0.txt and, inside the
+extension package, LICENSE-Apache-2.0.txt.

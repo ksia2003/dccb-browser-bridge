@@ -1,0 +1,27 @@
+# dependencies
+node_modules
+**/node_modules/
+
+# build output
+.output/
+.wxt/
+**/.output/
+**/.wxt/
+
+# secrets / tokens / keys (NEVER commit)
+.bridge-tokens.json
+**/.bb-v6-tokens.json
+**/bb-v6-tokens.json
+*.pem
+*.key
+
+# logs / temp
+*.log
+.DS_Store
+
+# third-party reference clone (keeps its own git history)
+ref-open-claude/
+
+# Relay credentials written beside the code by older runs (11-06 review)
+.bb-v6-tokens*.json
+http-control.secret

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Browser Bridge</title>
+  <style>
+    :root{color-scheme:light dark;--bg:#fff;--fg:#202124;--muted:#5f6368;--line:#dadce0;--soft:#f8f9fa;--blue:#1a73e8;--red:#b3261e;--green:#188038}
+    @media(prefers-color-scheme:dark){:root{--bg:#202124;--fg:#e8eaed;--muted:#9aa0a6;--line:#5f6368;--soft:#292a2d;--blue:#8ab4f8;--red:#f28b82;--green:#81c995}}
+    *{box-sizing:border-box}body{width:340px;margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+    header{display:flex;align-items:center;gap:9px;padding:15px 16px 12px;border-bottom:1px solid var(--line)}header img{width:22px;height:22px}header strong{font-size:14px;font-weight:600}
+    main{padding:15px 16px 16px}.status{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-weight:600}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.dot.connected{background:var(--green)}.dot.connecting{background:#e6a23c}.dot.expired,.dot.address_error{background:var(--red)}
+    .update-banner{margin:0 0 14px;padding:10px 11px;border:1px solid #e67e22;border-radius:6px;background:#fff4e5;color:#6b3a00;font-size:12px;line-height:1.45}.update-banner strong,.update-banner span{display:block}.update-banner strong{margin-bottom:3px}
+    @media(prefers-color-scheme:dark){.update-banner{background:#3a2b1d;color:#ffd8a8;border-color:#a65b13}}
+    .summary,.diagnosis,.hint{color:var(--muted);font-size:12px}.summary{margin:0 0 14px}.diagnosis{border-top:1px solid var(--line);padding-top:11px;margin-top:14px;line-height:1.5}
+    .field{margin:12px 0}label{display:block;margin-bottom:5px;font-weight:500}input{width:100%;height:34px;padding:6px 9px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);font:inherit}input:focus{outline:2px solid var(--blue);outline-offset:1px}
+    button{font:inherit;cursor:pointer}button.primary{height:34px;border:1px solid var(--blue);border-radius:5px;background:var(--blue);color:#fff;padding:0 13px;font-weight:600}button.text{border:0;background:none;color:var(--blue);padding:3px 0;text-align:left}button.text.danger{color:var(--red)}.actions{display:flex;gap:14px;margin-top:8px}
+    .line{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;border-top:1px solid var(--line)}.line small{display:block;color:var(--muted);font-size:11px}.switch{position:relative;width:36px;height:20px;border:0;border-radius:11px;background:var(--muted);flex:none}.switch:after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff}.switch.on{background:var(--blue)}.switch.on:after{left:18px}
+    .meta{margin:10px 0 0;display:grid;grid-template-columns:95px 1fr;gap:5px 9px;font-size:12px}.meta dt{color:var(--muted)}.meta dd{margin:0;overflow-wrap:anywhere}.section-title{font-weight:600;margin:13px 0 6px}.activity{margin:0;padding:0;list-style:none;font-size:12px}.activity li{display:flex;justify-content:space-between;gap:8px;padding:4px 0}.activity time{color:var(--muted)}.error{color:var(--red);font-size:12px;margin:9px 0}.hint{margin:9px 0 0}footer{border-top:1px solid var(--line);padding:9px 16px;color:var(--muted);font-size:11px}
+    [hidden]{display:none!important}
+  </style>
+</head>
+<body>
+  <header><img src="/icon/48.png" alt=""><strong>Browser Bridge</strong></header>
+  <main>
+    <div class="update-banner" id="update-banner" role="status" hidden><strong id="update-title"></strong><span id="update-instructions"></span></div>
+    <div class="status"><span class="dot" id="status-dot"></span><span id="status-label">상태 확인 중…</span></div>
+    <p class="summary" id="summary">내 Chrome의 DCCB 전용 탭만 제어합니다.</p>
+    <section id="setup-panel" hidden>
+      <div class="field"><label for="address">연결 주소</label><input id="address" type="url" placeholder="대시보드의 주소 붙여넣기" autocomplete="off" spellcheck="false"></div>
+      <div class="field"><label for="code">8자리 코드</label><input id="code" type="text" placeholder="예: Q7M2 K9TX" autocomplete="off" spellcheck="false"></div>
+      <p class="error" id="setup-error" hidden></p>
+      <button class="primary" id="connect">연결하기</button>
+      <p class="hint">코드가 만료되면 대시보드에서 새 코드를 확인하세요.</p>
+    </section>
+    <section id="connected-panel" hidden>
+      <div class="line"><div><strong>브릿지 사용</strong><small>끄면 등록 정보는 남고 작업은 중단됩니다.</small></div><button class="switch" id="toggle" role="switch" aria-label="브릿지 사용" aria-checked="false"></button></div>
+      <div class="field"><label for="device-name">기기 이름</label><input id="device-name" maxlength="40" autocomplete="off"></div>
+      <dl class="meta"><dt>연결 대상</dt><dd id="connected-address"></dd><dt>연결 경로</dt><dd>자동 설정</dd><dt>마지막 성공</dt><dd id="last-connected">—</dd><dt>다음 재시도</dt><dd id="next-retry">—</dd></dl>
+      <p id="target-info" style="overflow-wrap:anywhere;white-space:pre-wrap"></p><small id="last-action"></small><p id="focus-error"></p><p id="pipe-problem" style="color:#b3261e;overflow-wrap:anywhere"></p>
+      <label><input id="dedicated-window" type="checkbox" style="width:auto;height:auto"> AI 전용 창 (새 탭, 기본 꺼짐)</label>
+      <div class="line"><div><strong>AI 작업 탭 보기</strong><small>누르면 Chrome이 해당 탭으로 이동합니다.</small></div><button class="text" id="show-ai-tab">작업 탭으로 이동</button></div>
+      <div class="line"><div><strong>사람에게 넘기기</strong><small>로그인·캡차를 직접 처리한 뒤 계속하세요.</small></div><div><button class="text" id="handoff">넘기기</button> <button class="text danger" id="stop-handoff" hidden>중단</button></div></div>
+      <p id="handoff-message" class="hint" hidden></p>
+      <div class="section-title">최근 AI 동작</div><ul class="activity" id="activity"><li>아직 동작이 없습니다.</li></ul>
+      <div class="actions"><button class="text danger" id="reset">등록 정보 지우고 다시 설정</button></div>
+    </section>
+    <div class="diagnosis" id="diagnosis">연결 상태를 확인하는 중입니다.</div>
+  </main>
+  <footer>내 탭과 분리된 DCCB 탭 그룹에서만 작업합니다. <small id="version"></small></footer>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

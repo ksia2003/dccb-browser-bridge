@@ -1,0 +1,28 @@
+{
+  "name": "dccb-browser-bridge",
+  "version": "1.2.2",
+  "private": true,
+  "type": "module",
+  "description": "DCCB Browser Bridge V8 — address-and-code enrollment Chrome MV3 extension + relay",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "package": "node scripts/package-extension.mjs",
+    "package:relay": "node scripts/package-relay.mjs",
+    "genkey": "node scripts/genkey.mjs",
+    "server": "tsx server/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsx test/peer-uid.unit.mjs && tsx test/target.unit.test.mjs && tsx test/enrollment.unit.mjs && tsx test/public-door.unit.mjs && tsx test/public-door.integration.mjs && tsx test/http-handler.unit.mjs && tsx test/cdp-lifecycle.unit.mjs && tsx test/v8-profile.unit.mjs && node test/relay-release.unit.mjs && tsx test/fetch-tool.unit.mjs && node test/http-control.integration.mjs && node test/ws-origin.integration.mjs && tsx test/pipe.unit.mjs",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "wxt": "^0.19.0"
+  }
+}
