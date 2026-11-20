@@ -45,6 +45,15 @@ export interface ExtensionHello {
   version: string;
 }
 
+/**
+ * Extension → relay, sent just before the person's on/off switch closes the socket (6.0.2). It lets
+ * the relay tell "the person switched Browser Bridge off" from "this PC is off or offline". A relay
+ * that does not know the frame ignores it, and an older extension never sends it.
+ */
+export interface ExtensionSwitchedOff {
+  type: "extension_switched_off";
+}
+
 /** Relay → extension: current version of the ZIP this HOME distributes. */
 export interface LatestExtensionVersion {
   type: "latest_extension_version";
@@ -116,7 +125,7 @@ export interface PipeEvent {
 export const PIPE_MIN_EXTENSION_VERSION = "1.1.0";
 
 /** Any message that can cross the wire in either direction. */
-export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | LatestExtensionVersion
+export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | ExtensionSwitchedOff | LatestExtensionVersion
   | PipeOpen | PipeClose | PipeCommand | PipeResponse | PipeEvent;
 
 /** Chrome's manifest version for this release line is three numeric components. */

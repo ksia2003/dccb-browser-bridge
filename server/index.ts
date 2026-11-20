@@ -97,8 +97,17 @@ interface ConnectedBrowser {
   name: string;
   connectedAt: string;
   version: string | null;
+  /** Set when the extension said the person switched it off; the socket is about to close. */
+  switchedOffAt?: string;
 }
 const browsers = new Map<string, ConnectedBrowser>();
+/**
+ * Browsers the person switched off in the extension popup (6.0.2), kept after their socket closes so
+ * a dispatch can say so instead of "no extension connected". Cleared when that browser connects again.
+ */
+const switchedOff = new Map<string, { name: string; at: string }>();
+/** The browser whose socket closed last, if the person switched it off; any other last departure clears it. */
+let lastGoneSwitchedOff: string | null = null;
 /** The first Browser Bridge from the Chrome Web Store; older copies were unpacked from a ZIP. */
 const STORE_EXTENSION_VERSION = "6.0.0";
 let cachedReleaseVersion: { path: string; size: number; mtimeMs: number; version: string | null } | undefined;
@@ -364,6 +373,8 @@ function handleConnection(
     version: null,
   };
   browsers.set(id, entry);
+  switchedOff.delete(id);
+  lastGoneSwitchedOff = null;
   log(`extension connected: ${id} (${name}); ${browsers.size} now connected`);
   const route = routeFromEnvironment();
   const latestExtensionVersion = refreshDistributedExtensionVersion();
@@ -412,6 +423,15 @@ function handleConnection(
         if (current?.ws === ws) current.version = isExtensionVersion(msg.version) ? msg.version : null;
         break;
       }
+      case "extension_switched_off": {
+        const current = browsers.get(id);
+        if (current?.ws === ws) {
+          current.switchedOffAt = new Date().toISOString();
+          switchedOff.set(id, { name: current.name, at: current.switchedOffAt });
+          log(`extension switched off by the person: ${id} (${current.name})`);
+        }
+        break;
+      }
       case "tool_response": {
         const waiter = pending.get(msg.id);
         if (waiter) {
@@ -441,6 +461,7 @@ function handleConnection(
     // above may have already swapped a newer socket in under the same key).
     if (browsers.get(id)?.ws === ws) {
       browsers.delete(id);
+      lastGoneSwitchedOff = entry.switchedOffAt ? id : null;
       log(`extension disconnected: ${id}; ${browsers.size} now connected`);
     }
   });
@@ -476,11 +497,12 @@ function send(ws: WebSocket, msg: BridgeMessage): void {
  *   - unknown_target  → a `target` was given but no browser has that id (404)
  *   - ambiguous       → multiple browsers, no `target` given; caller must pick (409)
  *   - timeout         → the chosen browser didn't respond in time (504)
+ *   - switched_off    → the person switched Browser Bridge off in that Chrome (503, like no_extension)
  */
 export class ToolDispatchError extends Error {
   constructor(
     message: string,
-    readonly code: "no_extension" | "unknown_target" | "ambiguous" | "timeout",
+    readonly code: "no_extension" | "switched_off" | "unknown_target" | "ambiguous" | "timeout",
     /** Extra data for the JSON body (e.g. the list of connected browsers). */
     readonly detail?: Record<string, unknown>,
   ) {
@@ -489,11 +511,31 @@ export class ToolDispatchError extends Error {
   }
 }
 
+/** A browser that is connected and has not just been switched off by the person (its socket closes next). */
+function isAvailable(b: ConnectedBrowser): boolean {
+  return b.ws.readyState === b.ws.OPEN && !b.switchedOffAt;
+}
+
+function switchedOffError(id: string): ToolDispatchError {
+  const off = switchedOff.get(id);
+  return new ToolDispatchError(
+    `the person switched Browser Bridge off in this Chrome${off ? ` (${off.name}, at ${off.at})` : ""}; it stays off until they turn it back on in the Browser Bridge extension popup. Ask them in chat to switch it on`,
+    "switched_off",
+    { target: id, switched_off: [{ id, ...off }] },
+  );
+}
+
 /** Snapshot of currently-connected browsers (for the list endpoint / errors). */
 function listBrowsers(): { id: string; name: string; connectedAt: string; version: string | null }[] {
   return [...browsers.values()]
-    .filter((b) => b.ws.readyState === b.ws.OPEN)
+    .filter(isAvailable)
     .map(({ id, name, connectedAt, version }) => ({ id, name, connectedAt, version }));
+}
+
+/** Browsers the person switched off, for listings; absent when there are none (old callers see no change). */
+function switchedOffBody(): { switched_off?: { id: string; name: string; at: string }[] } {
+  const off = [...switchedOff].filter(([id]) => !browsers.get(id) || !isAvailable(browsers.get(id)!)).map(([id, v]) => ({ id, ...v }));
+  return off.length ? { switched_off: off } : {};
 }
 
 /**
@@ -506,7 +548,8 @@ function listBrowsers(): { id: string; name: string; connectedAt: string; versio
 function resolveTarget(target?: string): ConnectedBrowser {
   if (target) {
     const b = browsers.get(target);
-    if (!b || b.ws.readyState !== b.ws.OPEN) {
+    if ((!b || !isAvailable(b)) && switchedOff.has(target)) throw switchedOffError(target);
+    if (!b || !isAvailable(b)) {
       throw new ToolDispatchError(
         `unknown target browser: ${target}`,
         "unknown_target",
@@ -516,8 +559,12 @@ function resolveTarget(target?: string): ConnectedBrowser {
     return b;
   }
 
-  const open = [...browsers.values()].filter((b) => b.ws.readyState === b.ws.OPEN);
+  const open = [...browsers.values()].filter(isAvailable);
   if (open.length === 0) {
+    if (lastGoneSwitchedOff !== null && switchedOff.has(lastGoneSwitchedOff)) throw switchedOffError(lastGoneSwitchedOff);
+    // A browser told the relay it was switched off but its socket has not closed yet.
+    const pendingOff = [...browsers.values()].find((b) => b.switchedOffAt);
+    if (pendingOff) throw switchedOffError(pendingOff.id);
     throw new ToolDispatchError("no extension connected", "no_extension");
   }
   if (open.length === 1) {
@@ -635,7 +682,7 @@ const handleHttpRequest = (req: IncomingMessage, res: ServerResponse) => {
     // `target`. 503 (not 200 with []) when none, mirroring /send's 503 so the
     // "nothing connected" case is one consistent status.
     const list = listBrowsers();
-    writeJson(res, list.length ? 200 : 503, { browsers: list });
+    writeJson(res, list.length ? 200 : 503, { browsers: list, ...switchedOffBody() });
     return;
   }
 
@@ -916,7 +963,7 @@ async function handleSend(req: IncomingMessage, res: ServerResponse): Promise<vo
     const list = listBrowsers();
     writeJson(res, list.length ? 200 : 503, {
       type: "tool_response",
-      result: { browsers: list },
+      result: { browsers: list, ...switchedOffBody() },
     });
     return;
   }
@@ -944,6 +991,7 @@ async function handleSend(req: IncomingMessage, res: ServerResponse): Promise<vo
 function dispatchStatus(code: ToolDispatchError["code"]): number {
   switch (code) {
     case "no_extension":
+    case "switched_off":
       return 503;
     case "unknown_target":
       return 404;
