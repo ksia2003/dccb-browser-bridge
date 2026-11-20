@@ -1,5 +1,5 @@
 /**
- * DCCB Browser Bridge — MV3 service worker (6.0.1).
+ * DCCB Browser Bridge — MV3 service worker (6.0.2).
  *
  * Keeps a WebSocket to the person's DCCB HOME relay. Page work arrives as `pipe_*` frames: a thin
  * chrome.debugger channel that agent-browser on the HOME drives (`pc-browser`, lib/pipe.ts).
@@ -16,7 +16,7 @@ import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, ownerOf, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import "./lib/tools"; // side-effect: registers the tools into the registry
 
@@ -82,6 +82,8 @@ function wsIsLive(): boolean {
 
 /** Open the gated WS. No-op if a socket is already live or no bearer exists. */
 function openSocket(): void {
+  // The person's switch is off: nothing reconnects (alarm, backoff and token refresh all land here).
+  if (!auth.isEnabled()) return;
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -263,7 +265,8 @@ function stopKeepalive(): void {
 // --- Popup ------------------------------------------------------------------
 
 interface PopupRequest {
-  type: "getState" | "setup" | "reset" | "setDeviceName" | "focusTarget";
+  type: "getState" | "setup" | "reconnect" | "setEnabled" | "setDeviceName" | "focusTarget";
+  enabled?: boolean;
   address?: string;
   code?: string;
   name?: string;
@@ -301,6 +304,24 @@ function pushSnapshot(): void {
   void popupSnapshot().then(snapshot => chrome.runtime.sendMessage({ type: "stateUpdate", snapshot })).catch(() => {});
 }
 
+/**
+ * The popup's on/off switch. Off: tell the relay it was the person (the socket must still be open,
+ * and a PC that merely went offline looks different to the AI), stop the AI's work, close the AI's
+ * tabs without asking (turning it off is the point), and close the socket without reconnecting.
+ * The profile stays, so on reconnects with no code.
+ */
+async function setEnabledByPerson(on: boolean): Promise<void> {
+  if (on) { await auth.setEnabled(true); return; }
+  send({ type: "extension_switched_off" });
+  // Collect the tabs before the owners are forgotten; closing them is the person's doing, not a
+  // "the person closed the AI's tab" stop (removeAiTabs marks the removals as expected).
+  const tabIds = (await listAiTabs()).flatMap(entry => entry.tab.id === undefined ? [] : [entry.tab.id]);
+  await auth.setEnabled(false); // closes the socket (ends every pipe) and sets state "off"
+  await setExecutionEnabled(false);
+  if (tabIds.length) await removeAiTabs(tabIds).catch(error => log("closing AI tabs failed", String(error)));
+  pushSnapshot();
+}
+
 function installPopupBridge(): void {
   chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse: (snapshot: unknown) => void): boolean => {
     const req = raw as PopupRequest;
@@ -312,8 +333,12 @@ function installPopupBridge(): void {
       case "setup":
         void auth.setup(req.address ?? "", req.code ?? "").then(reply);
         return true;
-      case "reset":
-        void setExecutionEnabled(false).then(() => auth.reset()).then(reply);
+      case "reconnect":
+        // A new address and code replace the profile only once redeemed; until then nothing changes.
+        void auth.setup(req.address ?? "", req.code ?? "", true).then(reply);
+        return true;
+      case "setEnabled":
+        void setEnabledByPerson(req.enabled === true).then(reply);
         return true;
       case "setDeviceName":
         void auth.setDeviceName(req.name ?? "").then(reply);

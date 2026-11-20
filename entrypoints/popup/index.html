@@ -18,13 +18,10 @@
     .wm{font-size:14px;font-weight:700;flex:1}
     .icon-btn{width:32px;height:32px;border:0;border-radius:8px;background:none;display:grid;place-items:center;color:var(--fg-2);cursor:pointer}
     .icon-btn:hover,.icon-btn[aria-expanded=true]{background:var(--bg-2)}
-    .icon-btn:focus-visible,.card:focus-visible,.menu button:focus-visible,.primary:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+    .icon-btn:focus-visible,.card:focus-visible,.menu button:focus-visible,.primary:focus-visible,.switch:focus-visible,.ghost:focus-visible,.cancel:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
     .menu{position:absolute;top:44px;right:8px;width:208px;padding:4px;border-radius:10px;background:var(--bg);border:1px solid var(--line);box-shadow:var(--shadow);z-index:2}
     .menu button{width:100%;height:36px;border:0;border-radius:6px;background:none;text-align:left;padding:0 12px;cursor:pointer}
     .menu button:hover{background:var(--bg-2)}
-    .menu .danger{color:var(--danger)}
-    .menu .confirm{padding:8px 8px 4px}.menu .confirm p{margin:0 0 8px;font-size:12px;line-height:18px;color:var(--fg-2)}
-    .menu .confirm .row{display:flex;gap:8px}.menu .confirm .row button{flex:1;text-align:center;border:1px solid var(--line)}
     .menu form{padding:8px 8px 4px}
     .menu label{display:block;font-size:12px;font-weight:600;color:var(--fg-2);margin-bottom:6px}
     .menu input{width:100%;height:32px;border-radius:6px;border:1px solid var(--line);background:var(--bg-2);padding:0 10px}
@@ -38,7 +35,7 @@
     @keyframes pulse{0%{transform:scale(.9);opacity:.35}100%{transform:scale(1.15);opacity:0}}
     @keyframes spin{to{transform:rotate(360deg)}}
     @media(prefers-reduced-motion:reduce){.orb.busy::after,.orb.idle svg{animation:none}}
-    .ok{color:var(--ok)}.busy{color:var(--busy)}.idle{color:var(--idle)}
+    .ok{color:var(--ok)}.off{color:var(--idle)}.busy{color:var(--busy)}.idle{color:var(--idle)}
     .title{font-size:18px;line-height:24px;font-weight:700;margin:0 0 4px}
     .desc{color:var(--fg-2);margin:0}
     .card{display:flex;gap:12px;align-items:center;width:calc(100% - 32px);margin:0 16px 16px;padding:12px;border:0;border-radius:10px;background:var(--bg-2);text-align:left;cursor:pointer}
@@ -57,6 +54,19 @@
     .form input:focus{outline:2px solid var(--brand);outline-offset:-1px;background:var(--bg)}
     .primary{width:100%;height:40px;margin-top:16px;border:0;border-radius:8px;background:var(--brand);color:#fff;font-size:14px;font-weight:700;cursor:pointer}
     .primary:disabled{opacity:.6;cursor:default}
+    /* The settings box under the status: the person's switch, and re-connecting with a new code. The
+       switch's on colour is status (--ok), never the brand colour. */
+    .set{margin:0 16px 16px;border-radius:10px;background:var(--bg-2)}
+    .set .line{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px}
+    .set .line+.line{border-top:1px solid var(--line)}
+    .set strong{display:block;font-weight:600}.set small{display:block;color:var(--fg-2);font-size:12px;line-height:16px}
+    .switch{position:relative;width:36px;height:20px;border:0;border-radius:11px;background:var(--fg-3);flex:none;padding:0;cursor:pointer}
+    .switch:after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .12s}
+    .switch[aria-checked=true]{background:var(--ok)}.switch[aria-checked=true]:after{left:18px}
+    .switch:disabled{opacity:.6;cursor:default}
+    @media(prefers-reduced-motion:reduce){.switch:after{transition:none}}
+    .ghost{height:30px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);font-weight:600;flex:none;cursor:pointer}
+    .cancel{width:100%;height:36px;margin-top:8px;border:0;border-radius:8px;background:none;color:var(--fg-2);font-weight:600;cursor:pointer}
     .error{color:var(--danger);font-size:12px;line-height:16px;margin:8px 0 0}
     .notice{margin:0 16px 16px;padding:10px 12px;border-radius:10px;background:var(--bg-2);font-size:12px;line-height:18px;color:var(--fg-2)}
     .notice b{color:var(--fg)}
@@ -78,6 +88,7 @@
       <symbol id="check" viewBox="0 0 24 24"><path d="M5 12.5l4.2 4.2L19 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
       <symbol id="spark" viewBox="0 0 24 24"><path d="M12 3l1.9 5.6 5.6 1.9-5.6 1.9L12 18l-1.9-5.6-5.6-1.9 5.6-1.9z" fill="currentColor"/></symbol>
       <symbol id="sync" viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-13.7 5.7M4 12a8 8 0 0 1 13.7-5.7M18 3v4h-4M6 21v-4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></symbol>
       <symbol id="dots" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="19" r="1.6" fill="currentColor"/></symbol>
       <symbol id="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     </defs>
@@ -89,21 +100,20 @@
     <button class="icon-btn" id="more" aria-label="메뉴" aria-haspopup="menu" aria-expanded="false" hidden><svg width="18" height="18"><use href="#dots"/></svg></button>
     <div class="menu" id="menu" role="menu" hidden>
       <form id="name-form"><label for="device-name">기기 이름</label><input id="device-name" maxlength="40" autocomplete="off"></form>
-      <button class="danger" id="reset" role="menuitem">연결 다시 하기</button>
-      <div class="confirm" id="reset-confirm" hidden><p>이 Chrome의 연결을 지우고 주소와 코드를 다시 넣을까요?</p><div class="row"><button class="danger" id="reset-yes">지우기</button><button id="reset-no">취소</button></div></div>
     </div>
   </header>
 
   <section id="setup" hidden>
     <div class="hero" style="padding-bottom:4px">
-      <p class="title">내 서버와 연결하기</p>
-      <p class="desc">DCCB 대시보드의 주소와 코드를 넣으면<br>이후로는 알아서 연결됩니다.</p>
+      <p class="title" id="setup-title">내 서버와 연결하기</p>
+      <p class="desc" id="setup-desc">DCCB 대시보드의 주소와 코드를 넣으면<br>이후로는 알아서 연결됩니다.</p>
     </div>
     <form class="form" id="setup-form">
       <label for="address">주소</label><input id="address" type="url" placeholder="https://…" autocomplete="off" spellcheck="false">
       <label for="code">코드</label><input id="code" type="text" placeholder="Q7M2 K9TX" autocomplete="off" spellcheck="false">
       <p class="error" id="setup-error" hidden></p>
       <button class="primary" id="connect" type="submit">연결</button>
+      <button class="cancel" id="cancel" type="button" hidden>취소</button>
     </form>
     <p class="notice" id="pin-hint" hidden><b>아이콘을 늘 보이게 하려면</b><br>크롬 오른쪽 위 퍼즐 조각(확장 프로그램)을 누르고 Browser Bridge 옆 압정을 누르세요.</p>
   </section>
@@ -119,6 +129,10 @@
       <span class="text"><span class="k" id="page-label">지금 보는 페이지 · 누르면 이동</span><span class="t" id="page-title"></span><span class="u" id="page-host"></span></span>
       <svg class="go" width="16" height="16"><use href="#chev"/></svg>
     </button>
+    <div class="set" id="settings">
+      <div class="line"><div><strong>AI가 이 Chrome 쓰기</strong><small id="switch-hint"></small></div><button class="switch" id="switch" type="button" role="switch" aria-checked="true" aria-label="AI가 이 Chrome 쓰기"></button></div>
+      <div class="line"><div><strong>다시 연결하기</strong><small>새 주소와 코드로 바꿉니다</small></div><button class="ghost" id="reconnect" type="button">다시 연결</button></div>
+    </div>
     <p class="notice" id="update" hidden></p>
     <p class="notice" id="site-access" hidden><b>사이트 액세스가 제한돼 있어요</b><br>AI가 일부 사이트에서 일하지 못할 수 있습니다. <code>chrome://extensions</code> → Browser Bridge 세부정보 → 사이트 액세스를 "모든 사이트에서"로 바꿔 주세요.</p>
     <p class="notice" id="welcome-done" hidden>연결됐습니다. 이 탭은 닫아도 됩니다.</p>
