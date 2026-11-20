@@ -1,8 +1,7 @@
 /**
- * lib/target.ts (6.0.0): the AI's tabs are ordinary background tabs it opened itself, never grouped,
- * never brought forward except from the popup's card; pages they open join their work space; the
- * pre-6.0.0 tab group is left behind once. These run without Chrome: the small chrome.* double below
- * models only the APIs target.ts uses (it has no tabs.group, so any grouping fails the run).
+ * lib/target.ts (6.0.1): AI tabs stay ordinary background tabs unless the HOME enables tab groups;
+ * the pre-6.0.0 tab group is left behind once. These run without Chrome: the small chrome.* double
+ * below models only the APIs target.ts uses.
  *
  * Run: npm run test:unit
  */
@@ -36,6 +35,9 @@ const creations = [];
 const moves = [];
 const createdWindows = [];
 const ungrouped = [];
+const groupsById = new Map();
+const groupCalls = [];
+let nextGroupId = 100;
 const stored = {};
 // Tabs 10 and 40 were opened for the AI in this browser session.
 const sessionStored = { v8TabWorkspaces: { 10: "default", 40: "default" } };
@@ -112,6 +114,20 @@ globalThis.chrome = {
         ungrouped.push(id);
       }
     },
+    async group({ tabIds, groupId }) {
+      const ids = [tabIds].flat();
+      const first = tabsById.get(ids[0]);
+      if (!first) throw new Error(`tab ${ids[0]} not found`);
+      const id = groupId ?? nextGroupId++;
+      if (!groupsById.has(id)) groupsById.set(id, { id, windowId: first.windowId, title: "", collapsed: false });
+      for (const tabId of ids) {
+        const tab = tabsById.get(tabId);
+        if (!tab || tab.windowId !== first.windowId) throw new Error("tabs must share a window");
+        tab.groupId = id;
+      }
+      groupCalls.push({ ids, id });
+      return id;
+    },
     async create(createProperties = {}) {
       const id = Math.max(...tabsById.keys()) + 1;
       const tab = { id, groupId: -1, windowId: createProperties.windowId ?? 1, active: createProperties.active !== false, url: createProperties.url ?? "about:blank" };
@@ -119,6 +135,19 @@ globalThis.chrome = {
       tabsById.set(id, tab);
       await onCreated.emit({ ...tab });
       return { ...tab };
+    },
+  },
+  tabGroups: {
+    async query({ windowId } = {}) {
+      const values = [...groupsById.values()];
+      return windowId === undefined ? values.map(group => ({ ...group }))
+        : values.filter(group => group.windowId === windowId).map(group => ({ ...group }));
+    },
+    async update(id, changes) {
+      const group = groupsById.get(id);
+      if (!group) throw new Error(`group ${id} not found`);
+      Object.assign(group, changes);
+      return { ...group };
     },
   },
   windows: {
@@ -175,6 +204,7 @@ const {
   popupTarget,
   focusPopupTarget,
   migrateFromTabGroups,
+  setAiTabGroupingEnabled,
   setTargetTab,
   installSeenWatch,
 } = await import("../entrypoints/lib/target.ts");
@@ -262,7 +292,7 @@ check(
   JSON.stringify({ tab: tabsById.get(70), windows: [...windowsById.values()] }),
 );
 
-// New AI tabs: inactive, never grouped, next to the work space's other tabs or in the last focused
+// New AI tabs default to ungrouped, next to the work space's other tabs or in the last focused
 // normal window; a second work space gets its own tabs in the same way.
 const research = await createControlledTab("https://research.test/", "research");
 check(
@@ -271,20 +301,57 @@ check(
     && await ownerOf(research.id) === "research",
   JSON.stringify(creations.at(-1)),
 );
+setAiTabGroupingEnabled(true);
+const groupedResearch = await createControlledTab("https://research.test/grouped", "research");
+const firstAiGroup = groupsById.get(tabsById.get(groupedResearch.id)?.groupId);
+check(
+  "the opt-in makes a named, expanded AI group in the tab's window",
+  firstAiGroup?.title === "AI · 이 컴퓨터의 Chrome" && firstAiGroup.collapsed === false
+    && groupedResearch.windowId === 1,
+  JSON.stringify({ tab: tabsById.get(groupedResearch.id), group: firstAiGroup }),
+);
 windowsById.set(5, { id: 5, focused: true, type: "normal" });
 windowsById.get(1).focused = false;
 const second = await createControlledTab("https://research.test/2", "research");
-check("its next tab opens beside it, not in the window the person moved to", second.windowId === 1, JSON.stringify(second));
+check(
+  "work spaces in the same window share one AI group",
+  second.windowId === 1 && tabsById.get(second.id)?.groupId === tabsById.get(groupedResearch.id)?.groupId
+    && groupsById.size === 1,
+  JSON.stringify({ second, groups: [...groupsById.values()] }),
+);
 const shopping = await createControlledTab("https://shopping.test/", "shopping");
+check(
+  "a different Chrome window gets its own AI group",
+  shopping.windowId === 5 && tabsById.get(shopping.id)?.groupId !== tabsById.get(groupedResearch.id)?.groupId
+    && groupsById.size === 2 && groupCalls.length === 3,
+  JSON.stringify({ shopping, groups: [...groupsById.values()] }),
+);
 check(
   "work spaces see only their own tabs",
   shopping.windowId === 5
-    && (await listDccbTabs("research")).map(tab => tab.id).join() === `${research.id},${second.id}`
+    && (await listDccbTabs("research")).map(tab => tab.id).join() === `${research.id},${groupedResearch.id},${second.id}`
     && (await listDccbTabs("shopping")).map(tab => tab.id).join() === String(shopping.id)
     && !(await isControlledTab(shopping.id, "research")),
 );
-await onRemoved.emit(shopping.id);
+tabsById.set(95, { id: 95, groupId: -1, windowId: 1, active: true, openerTabId: groupedResearch.id, url: "https://research-child.test/", title: "AI child" });
+await onCreated.emit({ ...tabsById.get(95) });
+await onCreatedNavigationTarget.emit({ tabId: 95, sourceTabId: groupedResearch.id, sourceFrameId: 0, url: "https://research-child.test/", timeStamp: Date.now() });
+await tick();
+check(
+  "a page opened by an AI tab joins that window's AI group",
+  await ownerOf(95) === "research" && tabsById.get(95)?.groupId === tabsById.get(groupedResearch.id)?.groupId,
+  JSON.stringify({ child: tabsById.get(95), groups: [...groupsById.values()] }),
+);
+setAiTabGroupingEnabled(false);
+const afterToggleOff = await createControlledTab("https://research.test/after-toggle-off", "research");
+check(
+  "turning the setting off leaves later tabs ungrouped",
+  tabsById.get(afterToggleOff.id)?.groupId === -1 && groupsById.size === 2,
+  JSON.stringify({ tab: tabsById.get(afterToggleOff.id), groups: [...groupsById.values()] }),
+);
 tabsById.delete(shopping.id);
+await onRemoved.emit(shopping.id);
+await tick();
 check("a closed tab leaves its work space", (await listDccbTabs("shopping")).length === 0 && await ownerOf(shopping.id) === null);
 
 // With no normal window open (Chrome running in the background), one opens without taking focus.

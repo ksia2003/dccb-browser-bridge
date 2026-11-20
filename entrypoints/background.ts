@@ -1,5 +1,5 @@
 /**
- * DCCB Browser Bridge — MV3 service worker (6.0.0).
+ * DCCB Browser Bridge — MV3 service worker (6.0.1).
  *
  * Keeps a WebSocket to the person's DCCB HOME relay. Page work arrives as `pipe_*` frames: a thin
  * chrome.debugger channel that agent-browser on the HOME drives (`pc-browser`, lib/pipe.ts).
@@ -16,7 +16,7 @@ import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, ownerOf, popupTarget, setLastWorkspace } from "./lib/target";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, migrateFromTabGroups, ownerOf, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import "./lib/tools"; // side-effect: registers the tools into the registry
 
@@ -205,6 +205,7 @@ function scheduleReconnect(): void {
 function handleMessage(msg: BridgeMessage): void {
   switch (msg.type) {
     case "relay_binding":
+      setAiTabGroupingEnabled(msg.tab_group === true);
       void auth.onRelayBinding(msg.relay_binding).then(accepted => {
         if (accepted) {
           latestExtensionVersion = isExtensionVersion(msg.latest_extension_version) ? msg.latest_extension_version : null;
@@ -234,7 +235,7 @@ function handleMessage(msg: BridgeMessage): void {
       closePipe(msg.channel);
       break;
     case "pong":
-      // keepalive acknowledged; nothing to do.
+      setAiTabGroupingEnabled(msg.tab_group === true);
       break;
     default:
       log("ignoring inbound", msg.type);

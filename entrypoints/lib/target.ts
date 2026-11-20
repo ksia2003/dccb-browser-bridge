@@ -1,23 +1,27 @@
 /**
- * DCCB Browser Bridge — the AI's tabs (6.0.0, owner 11-08).
+ * DCCB Browser Bridge — the AI's tabs (6.0.1).
  *
  * The AI works in ordinary tabs it opened itself: background tabs at the end of a normal window,
- * never brought forward and never grouped (Chrome files every tab group in its saved-groups bar and
- * keeps it there after the window closes; nothing an extension can remove). Which tab belongs to
- * which work space is kept for this browser session; a tab nobody opened for the AI is the
- * person's and is never offered to an engine. The person brings an AI tab forward only from the
- * popup's card.
+ * never brought forward and, unless the HOME opts in, never grouped. Which tab belongs to which
+ * work space is kept for this browser session; a tab nobody opened for the AI is the person's and
+ * is never offered to an engine. The person brings an AI tab forward only from the popup's card.
  *
  * Nothing disappears on its own (owner 11-08): an AI tab closes only when the AI says it is done,
  * and not even then once the person has looked at it — then it is theirs. AI tabs are muted until
  * the person looks at them (a video the AI opens must not play out of a tab nobody sees).
  */
-
+import { connectionKey, snapshot } from "./v8-auth";
 
 export const LAST_WORKSPACE_KEY = "v8LastWorkspace";
 const DEFAULT_WORKSPACE = "default";
 const currentTargets = new Map<string, number | null>();
 let lastWorkspace = DEFAULT_WORKSPACE;
+let aiTabGroupingEnabled = false;
+
+/** Set by the HOME relay; missing settings keep 6.0.0's ungrouped behavior. */
+export function setAiTabGroupingEnabled(enabled: boolean): void {
+  aiTabGroupingEnabled = enabled;
+}
 
 export function normalizeWorkspace(value?: unknown): string {
   if (value === undefined) return DEFAULT_WORKSPACE;
@@ -182,9 +186,38 @@ async function createClientTab(url: string | undefined, workspace: string): Prom
     tab = created.tabs![0];
   }
   await setOwner(tab.id!, workspace);
+  if (aiTabGroupingEnabled) await addToAiTabGroup(tab.id!);
   await muteAiTab(tab.id!);
   setTargetTab(tab.id!, workspace);
   return tab;
+}
+
+let groupingQueue: Promise<void> = Promise.resolve();
+function addToAiTabGroup(tabId: number): Promise<void> {
+  const task = groupingQueue.then(() => addTabToAiGroup(tabId));
+  groupingQueue = task.catch(() => {});
+  return task;
+}
+
+async function addTabToAiGroup(tabId: number): Promise<void> {
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.windowId === undefined) return;
+  const title = `AI · ${snapshot().deviceName}`;
+  const [existing] = (await chrome.tabGroups.query({ windowId: tab.windowId }))
+    .filter(group => group.title === title);
+  try {
+    if (existing) {
+      await chrome.tabs.group({ tabIds: tabId, groupId: existing.id });
+    } else {
+      const groupId = await chrome.tabs.group({ tabIds: tabId });
+      const colors = ["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"] as const;
+      const colorIndex = Array.from(connectionKey()).reduce((sum, character) => sum + character.charCodeAt(0), 0) % colors.length;
+      await chrome.tabGroups.update(groupId, { title, color: colors[colorIndex]!, collapsed: false });
+    }
+  } catch (error) {
+    log("group add failed:", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
 }
 
 /** The AI tab the popup shows: the last work space's working tab, else any AI tab. */
@@ -450,6 +483,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       await chrome.tabs.move(tabId, { windowId: source.windowId, index: -1 });
     }
     await setOwner(tabId, workspace);
+    if (aiTabGroupingEnabled) await addToAiTabGroup(tabId);
     await muteAiTab(tabId);
     await restoreChildSelection(tabId, details.sourceTabId, source.windowId, restoreCandidate, activationMark);
     await restoreChildWindowFocus(originalWindowId, source.windowId, restoreCandidate, focusedBeforeMove, focusMark);

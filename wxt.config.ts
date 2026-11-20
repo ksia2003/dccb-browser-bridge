@@ -41,6 +41,7 @@ export default defineConfig({
       "storage",
       "alarms",
       "webNavigation",
+      "tabGroups",
     ],
     host_permissions: ["<all_urls>"],
   },

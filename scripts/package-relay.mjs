@@ -30,9 +30,11 @@ const required = [
   "server/auth.ts",
   "server/enrollment.ts",
   "server/public-door.ts",
+  "server/browser-bridge-settings.ts",
   "shared/protocol.ts",
   "node_modules/tsx/dist/loader.mjs",
   "node_modules/ws/index.js",
+  "node_modules/yaml/dist/index.js",
 ];
 for (const relative of required) {
   const path = join(root, relative);
@@ -42,7 +44,7 @@ for (const relative of required) {
 // The relay runs `server/` through tsx and talks WebSocket through ws; nothing
 // else from node_modules is loaded. Ship only those two packages and what they
 // pull in (esbuild and its native binary), not the extension build tools.
-const RUNTIME_PACKAGES = ["ws", "tsx"];
+const RUNTIME_PACKAGES = ["ws", "tsx", "yaml"];
 function findPackage(name, fromDir) {
   for (let dir = fromDir; ; dir = dirname(dir)) {
     const candidate = join(dir, "node_modules", name);

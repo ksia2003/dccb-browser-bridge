@@ -44,6 +44,7 @@ import {
 import { createPipeEndpoint } from "./pipe/endpoint.js";
 import { runHttpHandler } from "./http-handler.js";
 import { allowExtensionOrigin, isChromeExtensionOrigin } from "./origin.js";
+import { browserBridgeTabGroupEnabled } from "./browser-bridge-settings.js";
 import {
   BrowserBridgeEnrollmentStore,
   routeFromEnvironment,
@@ -371,6 +372,7 @@ function handleConnection(
     relay_binding: route.relayBinding,
     browser_id: id,
     latest_extension_version: latestExtensionVersion,
+    tab_group: browserBridgeTabGroupEnabled(),
   });
 
   // If this connection was bearer-authed (not trusted-local), poll the token's
@@ -403,7 +405,7 @@ function handleConnection(
     switch (msg.type) {
       case "ping":
         refreshDistributedExtensionVersion();
-        send(ws, { type: "pong" });
+        send(ws, { type: "pong", tab_group: browserBridgeTabGroupEnabled() });
         break;
       case "extension_hello": {
         const current = browsers.get(id);

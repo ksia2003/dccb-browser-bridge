@@ -54,6 +54,8 @@ export interface LatestExtensionVersion {
 /** Liveness reply (server → extension). */
 export interface Pong {
   type: "pong";
+  /** HOME's optional Browser Bridge tab-group setting; absent means ungrouped. */
+  tab_group?: boolean;
 }
 
 /** First server frame after a V8 connection. The extension refuses a changed HOME binding. */
@@ -62,6 +64,8 @@ export interface RelayBinding {
   relay_binding: string;
   browser_id: string;
   latest_extension_version?: string | null;
+  /** HOME's optional Browser Bridge tab-group setting; absent means ungrouped. */
+  tab_group?: boolean;
 }
 
 /**
