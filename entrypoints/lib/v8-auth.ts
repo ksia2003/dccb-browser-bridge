@@ -170,10 +170,9 @@ function scheduleRefresh(): void {
 export async function init(nextHooks: AuthHooks): Promise<void> {
   hooks = nextHooks;
   const stored = await chrome.storage.local.get([PROFILE_KEY, ENABLED_KEY, NAME_KEY, LAST_CONNECTED_KEY]) as Record<string, unknown>;
-  // 6.0.0 has no on/off switch (a person turns the extension off in chrome://extensions); a Chrome
-  // switched off in an older version comes back on.
-  enabled = true;
-  if (stored[ENABLED_KEY] === false) await chrome.storage.local.remove(ENABLED_KEY);
+  // The popup's switch (back in 6.0.2, as in 1.2.x) is stored: a Chrome the person switched off stays
+  // off across browser restarts, with its profile kept so switching on needs no code.
+  enabled = stored[ENABLED_KEY] !== false;
   deviceName = typeof stored[NAME_KEY] === "string" && stored[NAME_KEY].trim() ? String(stored[NAME_KEY]).slice(0, 40) : defaultDeviceName();
   lastConnectedAt = typeof stored[LAST_CONNECTED_KEY] === "number" ? stored[LAST_CONNECTED_KEY] : null;
   if (!validProfile(stored.v8BrowserBridgeProfile)) {
@@ -198,21 +197,24 @@ const SETUP_ATTEMPTS = 3;
 const SETUP_RETRY_MS = 1_000;
 
 /** Redeem the dashboard's short-lived code immediately; V8 never asks an AI to approve it. */
-export async function setup(address: string, setupCode: string): Promise<void> {
+export async function setup(address: string, setupCode: string, replace = false): Promise<void> {
+  // Re-connecting (`replace`) must not touch the standing connection until the new code is redeemed:
+  // a failure only reports its reason, and the state, profile and socket stay as they were.
+  const fail = (message: string, next: AuthState): void => {
+    error = message;
+    if (replace) notify(); else setState(next);
+  };
   let origin: string;
   try { origin = addressOrigin(address); }
-  catch (cause) { error = (cause as Error).message; setState("address_error"); return; }
+  catch (cause) { fail((cause as Error).message, "address_error"); return; }
   const code = setupCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (!/^[A-Z2-9]{8}$/.test(code)) {
-    error = "8자리 코드를 입력하세요";
-    setState("setup");
+    fail("8자리 코드를 입력하세요", "setup");
     return;
   }
-  enabled = true;
-  await chrome.storage.local.set({ [ENABLED_KEY]: true });
   const browserId = await stableBrowserId();
   error = null;
-  setState("connecting");
+  if (!replace) setState("connecting");
   // A network hiccup (Wi-Fi, a VPN reconnecting) should not make the person paste again: try a few
   // times before saying the address cannot be reached, and keep the reason in the worker's log.
   let response: Response | undefined;
@@ -229,14 +231,12 @@ export async function setup(address: string, setupCode: string): Promise<void> {
     }
   }
   if (!response) {
-    error = "주소에 연결할 수 없습니다. 주소가 맞는지, 이 PC가 서버에 접속할 수 있는지(예: Tailscale) 확인해 주세요";
-    setState("address_error");
+    fail("주소에 연결할 수 없습니다. 주소가 맞는지, 이 PC가 서버에 접속할 수 있는지(예: Tailscale) 확인해 주세요", "address_error");
     return;
   }
   const body = await response.json().catch(() => null);
   if (!response.ok) {
-    error = enrollmentError(response.status, body);
-    setState(/expired|used/.test(String((body as { error?: unknown } | null)?.error)) ? "expired" : "setup");
+    fail(enrollmentError(response.status, body), /expired|used/.test(String((body as { error?: unknown } | null)?.error)) ? "expired" : "setup");
     return;
   }
   try {
@@ -252,8 +252,37 @@ export async function setup(address: string, setupCode: string): Promise<void> {
       tokenExpiresAt: redeemed.expires_in ? Date.now() + redeemed.expires_in * 1_000 : null,
     });
   } catch (cause) {
-    error = (cause as Error).message;
-    setState("setup");
+    fail((cause as Error).message, "setup");
+    return;
+  }
+  // Redeemed: a new code also means the person wants it on, and the old socket (if any) goes.
+  enabled = true;
+  await chrome.storage.local.set({ [ENABLED_KEY]: true });
+  hooks?.closeSocket();
+  scheduleRefresh();
+  setState("connecting");
+  hooks?.openSocket();
+}
+
+/**
+ * The popup's switch. Off keeps the profile and closes the socket without reconnecting; on reconnects
+ * with the stored profile, no code needed. The caller tells the relay and stops the AI's work first
+ * (background.ts), because the socket must still be open for that.
+ */
+export async function setEnabled(next: boolean): Promise<void> {
+  if (!profile || next === enabled) return;
+  enabled = next;
+  await chrome.storage.local.set({ [ENABLED_KEY]: next });
+  error = null;
+  if (!next) {
+    clearRefreshTimer();
+    hooks?.closeSocket();
+    setState("off");
+    return;
+  }
+  if (requiresBearer() && profile.tokenExpiresAt !== null && profile.tokenExpiresAt <= Date.now()) {
+    setState("connecting");
+    await refreshAccessToken();
     return;
   }
   scheduleRefresh();
@@ -326,7 +355,7 @@ export async function refreshAccessToken(): Promise<boolean> {
   }
   await saveProfile({ ...profile, accessToken: token.access_token, tokenExpiresAt: Date.now() + token.expires_in * 1_000 });
   scheduleRefresh();
-  if (profile) hooks?.openSocket();
+  if (profile && enabled) hooks?.openSocket();
   return true;
 }
 
