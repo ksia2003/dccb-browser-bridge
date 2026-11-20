@@ -1,5 +1,5 @@
 /**
- * DCCB Browser Bridge — the AI's tabs (6.0.1).
+ * DCCB Browser Bridge — the AI's tabs (6.0.2).
  *
  * The AI works in ordinary tabs it opened itself: background tabs at the end of a normal window,
  * never brought forward and, unless the HOME opts in, never grouped. Which tab belongs to which
