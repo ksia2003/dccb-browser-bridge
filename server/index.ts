@@ -99,13 +99,18 @@ interface ConnectedBrowser {
   version: string | null;
   /** Set when the extension said the person switched it off; the socket is about to close. */
   switchedOffAt?: string;
+  /**
+   * The tailnet address the Chrome connected from, so a HOME can show it on the person's device row
+   * (6.0.2). Absent when it came through a loopback hop (the public door), where the address says nothing.
+   */
+  address?: string;
 }
 const browsers = new Map<string, ConnectedBrowser>();
 /**
  * Browsers the person switched off in the extension popup (6.0.2), kept after their socket closes so
  * a dispatch can say so instead of "no extension connected". Cleared when that browser connects again.
  */
-const switchedOff = new Map<string, { name: string; at: string }>();
+const switchedOff = new Map<string, { name: string; at: string; address?: string }>();
 /** The browser whose socket closed last, if the person switched it off; any other last departure clears it. */
 let lastGoneSwitchedOff: string | null = null;
 /** The first Browser Bridge from the Chrome Web Store; older copies were unpacked from a ZIP. */
@@ -365,12 +370,14 @@ function handleConnection(
     }
   }
 
+  const from = req.socket.remoteAddress?.replace("::ffff:", "");
   const entry: ConnectedBrowser = {
     ws,
     id,
     name,
     connectedAt: new Date().toISOString(),
     version: null,
+    ...(from && from !== "127.0.0.1" && from !== "::1" ? { address: from } : {}),
   };
   browsers.set(id, entry);
   switchedOff.delete(id);
@@ -427,7 +434,7 @@ function handleConnection(
         const current = browsers.get(id);
         if (current?.ws === ws) {
           current.switchedOffAt = new Date().toISOString();
-          switchedOff.set(id, { name: current.name, at: current.switchedOffAt });
+          switchedOff.set(id, { name: current.name, at: current.switchedOffAt, ...(current.address ? { address: current.address } : {}) });
           log(`extension switched off by the person: ${id} (${current.name})`);
         }
         break;
@@ -526,14 +533,14 @@ function switchedOffError(id: string): ToolDispatchError {
 }
 
 /** Snapshot of currently-connected browsers (for the list endpoint / errors). */
-function listBrowsers(): { id: string; name: string; connectedAt: string; version: string | null }[] {
+function listBrowsers(): { id: string; name: string; connectedAt: string; version: string | null; address?: string }[] {
   return [...browsers.values()]
     .filter(isAvailable)
-    .map(({ id, name, connectedAt, version }) => ({ id, name, connectedAt, version }));
+    .map(({ id, name, connectedAt, version, address }) => ({ id, name, connectedAt, version, ...(address ? { address } : {}) }));
 }
 
 /** Browsers the person switched off, for listings; absent when there are none (old callers see no change). */
-function switchedOffBody(): { switched_off?: { id: string; name: string; at: string }[] } {
+function switchedOffBody(): { switched_off?: { id: string; name: string; at: string; address?: string }[] } {
   const off = [...switchedOff].filter(([id]) => !browsers.get(id) || !isAvailable(browsers.get(id)!)).map(([id, v]) => ({ id, ...v }));
   return off.length ? { switched_off: off } : {};
 }
