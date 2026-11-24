@@ -10,6 +10,8 @@ export default defineConfig({
     description:
       "내 DCCB 서버의 AI가 이 Chrome의 뒤쪽 탭에서 웹 작업을 하도록 잇습니다. 내 탭은 건드리지 않습니다.",
     version,
+    // The heartbeat relies on WebSocket traffic keeping the MV3 service worker alive (Chrome 116+).
+    minimum_chrome_version: "116",
     // manifest_version is fixed to 3 by WXT's chrome-mv3 target (do not set here).
 
     // V8's common public identity. Its private signing key stays outside the
