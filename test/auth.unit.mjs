@@ -1,5 +1,5 @@
 /**
- * 6.0.2 token lifecycle (server/auth.ts): refresh rotates the refresh token only for a client that says
+ * 6.1.0 token lifecycle (server/auth.ts): refresh rotates the refresh token only for a client that says
  * it can store one (a 6.0.0/6.0.1 client keeps working, its token slid forward); a connection lives as
  * long as its login, not the 2 h access token; a re-enrollment retires older logins only when it is
  * ADMITTED, and tells their live connections at once; the id a bearer may use is the one it was enrolled

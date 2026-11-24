@@ -106,13 +106,13 @@ interface ConnectedBrowser {
   switchedOffAt?: string;
   /**
    * The tailnet address the Chrome connected from, so a HOME can show it on the person's device row
-   * (6.0.2). Absent when it came through a loopback hop (the public door), where the address says nothing.
+   * (6.1.0). Absent when it came through a loopback hop (the public door), where the address says nothing.
    */
   address?: string;
 }
 const browsers = new Map<string, ConnectedBrowser>();
 /**
- * Browsers the person switched off in the extension popup (6.0.2), kept after their socket closes so
+ * Browsers the person switched off in the extension popup (6.1.0), kept after their socket closes so
  * a dispatch can say so instead of "no extension connected". Cleared when that browser connects again.
  */
 const switchedOff = new Map<string, { name: string; at: string; address?: string }>();
@@ -133,7 +133,7 @@ const SWITCHED_OFF_KEEP_MS = Number(process.env.BB_SWITCHED_OFF_KEEP_MS) || 30 *
 function loadSwitchedOff(): void {
   try {
     const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as { version?: unknown; entries?: Record<string, { name?: unknown; at?: unknown; address?: unknown }>; lastGone?: unknown };
-    // The first 6.0.2 builds wrote a flat {id: record} map. Keep its unexpired records; which Chrome left
+    // Early 6.1.0 builds (never released) wrote a flat {id: record} map. Keep its unexpired records; which Chrome left
     // last is unknown there, so `lastGone` stays null (a restart answers no_extension until a switch-off).
     const records = data.version === 2 && data.entries ? data.entries : (data as unknown as Record<string, { name?: unknown; at?: unknown; address?: unknown }>);
     for (const [id, v] of Object.entries(records)) {
@@ -511,7 +511,7 @@ function handleConnection(
   // If this connection was bearer-authed (not trusted-local), close 4401 once its LOGIN ends (refresh
   // token expired or superseded by a re-enrollment). The 2 h access token that opened the socket does
   // not bound it: the extension refreshes it over HTTP and keeps this socket, so work in progress
-  // survives (6.0.2; 4401 at every access-token expiry used to end the AI's running work).
+  // survives (6.1.0; 4401 at every access-token expiry used to end the AI's running work).
   let tokenWatch: ReturnType<typeof setInterval> | null = null;
   if (bearer) {
     tokenWatch = setInterval(() => {

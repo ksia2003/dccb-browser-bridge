@@ -1,6 +1,6 @@
 {
   "name": "dccb-browser-bridge",
-  "version": "6.0.2",
+  "version": "6.1.0",
   "private": true,
   "type": "module",
   "description": "DCCB Browser Bridge V8 — address-and-code enrollment Chrome MV3 extension + relay",

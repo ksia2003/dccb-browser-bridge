@@ -1,5 +1,5 @@
 /**
- * 6.0.2: a Chrome the person switched off in the extension popup is told apart from "nothing connected".
+ * 6.1.0: a Chrome the person switched off in the extension popup is told apart from "nothing connected".
  * The extension sends `extension_switched_off` and closes; the relay then answers a tool with
  * `switched_off` (503, like no_extension), lists no connected browser, and forgets it on reconnect.
  * A browser that merely drops (PC off) stays a plain no_extension. Runs against an isolated relay.
@@ -35,7 +35,7 @@ async function extension(id) {
     if (attempt >= 50) throw new Error("the isolated relay did not accept connections");
     await sleep(200);
   }
-  socket.send(JSON.stringify({ type: "extension_hello", version: "6.0.2" }));
+  socket.send(JSON.stringify({ type: "extension_hello", version: "6.1.0" }));
   socket.on("message", data => {
     const message = JSON.parse(String(data));
     if (message.type === "tool_request") socket.send(JSON.stringify({ type: "tool_response", id: message.id, result: { ok: true } }));

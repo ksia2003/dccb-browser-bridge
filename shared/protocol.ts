@@ -46,7 +46,7 @@ export interface ExtensionHello {
 }
 
 /**
- * Extension → relay, sent just before the person's on/off switch closes the socket (6.0.2). It lets
+ * Extension → relay, sent just before the person's on/off switch closes the socket (6.1.0). It lets
  * the relay tell "the person switched Browser Bridge off" from "this PC is off or offline". A relay
  * that does not know the frame ignores it, and an older extension never sends it.
  */
@@ -200,7 +200,7 @@ export interface EnrollRedeemResponse {
 /** Success body for `POST /api/auth/token` and `/api/auth/refresh`. */
 export interface TokenResponse {
   access_token: string;
-  /** Present on enrollment and (6.0.2) on every refresh: the refresh token rotates. Absent from older relays' refresh. */
+  /** Present on enrollment and (6.1.0) on every refresh: the refresh token rotates. Absent from older relays' refresh. */
   refresh_token?: string;
   token_type: "bearer";
   /** Access-token lifetime, seconds. */

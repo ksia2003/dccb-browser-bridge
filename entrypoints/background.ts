@@ -1,5 +1,5 @@
 /**
- * DCCB Browser Bridge — MV3 service worker (6.0.2).
+ * DCCB Browser Bridge — MV3 service worker (6.1.0).
  *
  * Keeps a WebSocket to the person's DCCB HOME relay. Page work arrives as `pipe_*` frames: a thin
  * chrome.debugger channel that agent-browser on the HOME drives (`pc-browser`, lib/pipe.ts).

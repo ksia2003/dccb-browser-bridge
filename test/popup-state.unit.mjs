@@ -1,5 +1,5 @@
 /**
- * 6.0.2 pure popup/background rules: the toolbar badge precedence, the connecting-state wording
+ * 6.1.0 pure popup/background rules: the toolbar badge precedence, the connecting-state wording
  * (first connection vs short gap vs long unreachable), the update check, and the heartbeat rule.
  */
 import { badgeFor, updateAvailable } from "../entrypoints/lib/badge.ts";
@@ -30,8 +30,8 @@ check("disconnected beats update", badgeFor({ working: false, state: "login_ende
 const colors = new Set(["off", "login_ended"].map(state => badgeFor({ ...base, state }).color));
 check("off and disconnected differ in colour", colors.size === 2);
 
-check("update: unpacked copy behind the relay's ZIP", updateAvailable("6.0.1", "6.0.2", false));
-check("update: not for a Web Store copy, same or newer version, or unknown", !updateAvailable("6.0.1", "6.0.2", true) && !updateAvailable("6.0.2", "6.0.2", false) && !updateAvailable("6.0.3", "6.0.2", false) && !updateAvailable("6.0.2", null, false));
+check("update: unpacked copy behind the relay's ZIP", updateAvailable("6.0.1", "6.1.0", false));
+check("update: not for a Web Store copy, same or newer version, or unknown", !updateAvailable("6.0.1", "6.1.0", true) && !updateAvailable("6.1.0", "6.1.0", false) && !updateAvailable("6.1.1", "6.1.0", false) && !updateAvailable("6.1.0", null, false));
 
 // Connecting wording.
 const now = 1_000_000_000_000;

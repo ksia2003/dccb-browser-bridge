@@ -1,6 +1,6 @@
 # 개인정보 처리방침 · Privacy Policy
 
-DCCB Browser Bridge (Chrome 확장) · 시행일 2026-11-24 · Effective 2026-11-24 (6.0.2)
+DCCB Browser Bridge (Chrome 확장) · 시행일 2026-11-24 · Effective 2026-11-24 (6.1.0)
 
 [English below](#english)
 

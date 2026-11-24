@@ -1,5 +1,5 @@
 /**
- * 6.0.2: the popup's on/off switch and re-connecting (lib/v8-auth.ts). The switch persists (ENABLED_KEY)
+ * 6.1.0: the popup's on/off switch and re-connecting (lib/v8-auth.ts). The switch persists (ENABLED_KEY)
  * and init honours it; off keeps the profile and closes the socket without reopening; on reopens with
  * no code. Re-connecting keeps the old profile and socket when the redeem fails, and replaces them
  * only after it succeeds.

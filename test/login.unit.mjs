@@ -1,5 +1,5 @@
 /**
- * 6.0.2 login handling in the extension (lib/v8-auth.ts): the rotated refresh token is stored, a stale
+ * 6.1.0 login handling in the extension (lib/v8-auth.ts): the rotated refresh token is stored, a stale
  * access token is refreshed before a socket opens (one shared request), a login that ended keeps the
  * address and has its own state, renaming applies over the open socket without reconnecting, reset
  * forgets everything, and the retry reason reaches the snapshot.

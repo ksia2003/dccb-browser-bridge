@@ -1,5 +1,5 @@
 /**
- * 6.0.2 service-worker behaviour (entrypoints/background.ts) with a fake Chrome, a fake WebSocket and a
+ * 6.1.0 service-worker behaviour (entrypoints/background.ts) with a fake Chrome, a fake WebSocket and a
  * virtual clock: frames of an abandoned socket never reach its successor, no work is taken before the
  * relay is bound, a stalled handshake and a dead socket are dropped (but a pause only probes), a rename
  * made during the handshake is sent after binding, the off-notice survives a socket that never bound, and
@@ -52,7 +52,7 @@ let onNavigationTarget;
 const withStub = (object) => new Proxy(object, { get: (target, key) => key in target ? target[key] : stub() });
 globalThis.chrome = new Proxy(Object.fromEntries(Object.entries({
   storage: { local: area(local), session: area(session), onChanged: stub() },
-  runtime: { getManifest: () => ({ version: "6.0.2" }), getURL: (p) => p, onMessage: { addListener(fn) { onMessage = fn; } }, onInstalled: stub(), sendMessage: () => Promise.resolve() },
+  runtime: { getManifest: () => ({ version: "6.1.0" }), getURL: (p) => p, onMessage: { addListener(fn) { onMessage = fn; } }, onInstalled: stub(), sendMessage: () => Promise.resolve() },
   alarms: { create() {}, onAlarm: { addListener(fn) { onAlarm = fn; } } },
   windows: { async getLastFocused() { return { type: "normal", id: 1 }; } },
   tabs: { async create() { createCalls++; await createGate; return { id: 9, windowId: 1, index: 3 }; }, async query() { tabCalls.query++; return tabs; }, async remove(ids) { tabCalls.removed.push(...ids); tabs = tabs.filter(tab => !ids.includes(tab.id)); }, onRemoved: stub(), onUpdated: stub(), onCreated: stub(), onActivated: stub(), onAttached: stub(), onDetached: stub() },

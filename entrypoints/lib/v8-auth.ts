@@ -259,7 +259,7 @@ function scheduleRefresh(): void {
 export async function init(nextHooks: AuthHooks): Promise<void> {
   hooks = nextHooks;
   const stored = await chrome.storage.local.get([PROFILE_KEY, ENABLED_KEY, NAME_KEY, LAST_CONNECTED_KEY, LAST_ADDRESS_KEY, TERMINAL_KEY, OUTAGE_KEY]) as Record<string, unknown>;
-  // The popup's switch (back in 6.0.2, as in 1.2.x) is stored: a Chrome the person switched off stays
+  // The popup's switch (back in 6.1.0, as in 1.2.x) is stored: a Chrome the person switched off stays
   // off across browser restarts, with its profile kept so switching on needs no code.
   enabled = stored[ENABLED_KEY] !== false;
   deviceName = typeof stored[NAME_KEY] === "string" && stored[NAME_KEY].trim() ? String(stored[NAME_KEY]).slice(0, 40) : defaultDeviceName();
@@ -528,7 +528,7 @@ function retryRefreshLater(forGeneration: number): void {
 
 /**
  * Exchange the refresh token for a new access token and a rotated refresh token (the request says it can
- * store one, which is what makes a 6.0.2 relay rotate; an older relay ignores the field and sends none).
+ * store one, which is what makes a 6.1.0 relay rotate; an older relay ignores the field and sends none).
  * Callers at once (timer, 4401, a socket about to open, the alarm) share one request per login generation:
  * with rotation a second request would present a token that was just replaced.
  */

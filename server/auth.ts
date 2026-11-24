@@ -125,7 +125,7 @@ interface TokenEntry {
   /**
    * The login this token belongs to: the time its enrollment was redeemed (ms). Refresh rotation keeps
    * it, so a login keeps one identity for its whole life, and a later enrollment of the same browser
-   * has a larger value. Absent on tokens written before 6.0.2 (treated as 0, oldest).
+   * has a larger value. Absent on tokens written before 6.1.0 (treated as 0, oldest).
    */
   family?: number;
   /**
@@ -420,7 +420,7 @@ function err(status: number, code: string): AuthResult {
 /**
  * POST /api/auth/refresh — exchange a refresh token for a new access token.
  *
- * A client that sends `accepts_rotation: true` (the 6.0.2 extension, which stores a new refresh token)
+ * A client that sends `accepts_rotation: true` (the 6.1.0 extension, which stores a new refresh token)
  * gets a ROTATED refresh token: a fresh 30-day life, the old one revoked after a short grace. A client
  * that does not send it (6.0.0/6.0.1, which keep only the access token and would be locked out by a
  * rotation) keeps the old behaviour: only an access token comes back, and the refresh token it already
@@ -545,7 +545,7 @@ export function sessionForAccessToken(token: string): SessionHandle | null {
 /**
  * Whether the login behind a connection is still alive: it still holds a refresh token. A connection
  * is authenticated once, at its handshake; the 2-hour access token that opened it does not bound its
- * life (6.0.2: the extension refreshes that token without reopening the socket, and a relay that
+ * life (6.1.0: the extension refreshes that token without reopening the socket, and a relay that
  * closed on its expiry dropped the AI's running work every 2 hours). Ending the login (refresh token
  * expired, superseded by a re-enrollment) still ends the connection.
  */

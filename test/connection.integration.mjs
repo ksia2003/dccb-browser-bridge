@@ -1,5 +1,5 @@
 /**
- * 6.0.2 relay connection handling against an isolated relay: the switched-off record survives a relay
+ * 6.1.0 relay connection handling against an isolated relay: the switched-off record survives a relay
  * restart (state folder), a rename frame renames the live connection without reconnecting, and a socket
  * that goes silent is closed by the relay (heartbeat) while one that keeps pinging stays.
  */
@@ -49,7 +49,7 @@ async function extension(id, name = "Laptop", token = null, respond = true) {
     if (attempt >= 50) throw new Error("the isolated relay did not accept connections");
     await sleep(200);
   }
-  socket.send(JSON.stringify({ type: "extension_hello", version: "6.0.2" }));
+  socket.send(JSON.stringify({ type: "extension_hello", version: "6.1.0" }));
   socket.on("message", data => {
     const message = JSON.parse(String(data));
     if (respond && message.type === "tool_request") socket.send(JSON.stringify({ type: "tool_response", id: message.id, result: { ok: true } }));
@@ -215,7 +215,7 @@ try {
   await sleep(300);
   console.log("  PASS  a stale notice (the person switched on again) is acknowledged but not applied");
 
-  // The first 6.0.2 builds wrote switched-off.json as a flat id map: its unexpired records are kept.
+  // Early 6.1.0 builds (never released) wrote switched-off.json as a flat id map: its unexpired records are kept.
   const [wsPort3, httpPort3] = [await free(), await free()];
   mkdirSync(join(temp, "state3"), { recursive: true });
   writeFileSync(join(temp, "state3/switched-off.json"), JSON.stringify({ oldrecord: { name: "Old", at: new Date().toISOString() }, expired: { name: "Gone", at: "2020-01-01T00:00:00.000Z" } }));
