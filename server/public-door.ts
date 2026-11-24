@@ -22,7 +22,8 @@ import {
   checkWsBearer,
   enrollmentBindingForAccessToken,
   handleRefresh,
-  isAccessTokenValid,
+  isSessionLive,
+  sessionForAccessToken,
   issueEnrollmentTokens,
   type EnrollmentTokenBinding,
 } from "./auth.js";
@@ -345,8 +346,10 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   if (browserName) homeUrl.searchParams.set("name", browserName);
   const home = new WebSocket(homeUrl, { maxPayload: 0 });
   let closed = false;
+  // The connection lives as long as the login it was opened with, not the 2 h access token (auth.ts isSessionLive).
+  const session = sessionForAccessToken(bearer);
   let watch: ReturnType<typeof setInterval> | null = setInterval(() => {
-    if (!isAccessTokenValid(bearer)) close(WS_CLOSE_UNAUTHORIZED, "token_expired");
+    if (!session || !isSessionLive(session)) close(WS_CLOSE_UNAUTHORIZED, "login_ended");
   }, 30_000);
   const clearWatch = (): void => { if (watch) clearInterval(watch); watch = null; };
   const close = (code: number, reason: string): void => {
