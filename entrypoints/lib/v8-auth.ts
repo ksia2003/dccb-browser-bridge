@@ -12,6 +12,12 @@ const ENABLED_KEY = "v8BrowserBridgeEnabled";
 const NAME_KEY = "v8BrowserBridgeName";
 const LAST_CONNECTED_KEY = "v8BrowserBridgeLastConnected";
 const LAST_ADDRESS_KEY = "v8BrowserBridgeLastAddress";
+/** The terminal state (login ended, address error) with its reason, so a worker restart still shows it. */
+const TERMINAL_KEY = "v8BrowserBridgeTerminal";
+/** When the current outage began (first failed attempt after being connected, or since the start). */
+const OUTAGE_KEY = "v8BrowserBridgeOutageStart";
+/** No request to the relay's HTTP endpoints waits longer than this. */
+const REQUEST_DEADLINE_MS = 15_000;
 const REFRESH_LEAD_MS = 10 * 60 * 1_000;
 /** A socket is not opened with an access token that expires within this long; it is refreshed first. */
 const STALE_LEAD_MS = 2 * 60 * 1_000;
@@ -47,6 +53,7 @@ export interface AuthSnapshot {
   lastConnectedAt: number | null;
   nextRetryAt: number | null;
   retryReason: ConnectionIssue | null;
+  outageStartedAt: number | null;
 }
 
 export interface AuthHooks {
@@ -67,7 +74,34 @@ let nextRetryAt: number | null = null;
 let retryReason: ConnectionIssue | null = null;
 /** The last address a profile had, kept after the profile is wiped by a login that ended. */
 let lastAddress: string | null = null;
-let refreshing: Promise<boolean> | null = null;
+let outageStartedAt: number | null = null;
+/**
+ * Bumped whenever the stored login is replaced or dropped (a new code redeemed, login ended, reset,
+ * binding mismatch). A refresh remembers the generation it started in and discards its result if the
+ * login changed meanwhile, so a slow refresh of an old login can never overwrite or wipe a newer one.
+ */
+let generation = 0;
+let refreshing: { generation: number; promise: Promise<boolean> } | null = null;
+/** Credential commits (profile writes and wipes) run one at a time, each re-checking its generation. */
+let commitChain: Promise<unknown> = Promise.resolve();
+function serialized<T>(task: () => Promise<T>): Promise<T> {
+  const run = commitChain.then(task, task);
+  commitChain = run.catch(() => undefined);
+  return run;
+}
+/** Re-connect attempt currently in flight; cancelling bumps `setupAttempt` and aborts its requests. */
+let setupAttempt = 0;
+let setupAbort: AbortController | null = null;
+
+/** fetch with a deadline (and an optional outer abort); a stalled server cannot hold a caller forever. */
+async function fetchWithin(url: URL, init: RequestInit, outer?: AbortSignal): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_DEADLINE_MS);
+  const relay = (): void => controller.abort();
+  outer?.addEventListener("abort", relay);
+  try { return await fetch(url, { ...init, signal: controller.signal }); }
+  finally { clearTimeout(timer); outer?.removeEventListener("abort", relay); }
+}
 let hooks: AuthHooks | null = null;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -75,7 +109,7 @@ function notify(): void { hooks?.onChange(snapshot()); }
 function setState(next: AuthState): void { state = next; notify(); }
 
 export function snapshot(): AuthSnapshot {
-  return { state, address: profile?.addressOrigin ?? lastAddress, browserId: profile?.browserId ?? null, error, enabled, deviceName, lastConnectedAt, nextRetryAt, retryReason };
+  return { state, address: profile?.addressOrigin ?? lastAddress, browserId: profile?.browserId ?? null, error, enabled, deviceName, lastConnectedAt, nextRetryAt, retryReason, outageStartedAt };
 }
 
 /** Public route identity, not a credential; distinguishes HOME bindings on one door. */
@@ -83,6 +117,7 @@ export function connectionKey(): string {
   return JSON.stringify([profile?.addressOrigin, profile?.relayBinding, profile?.browserId]);
 }
 
+export function hasProfile(): boolean { return profile !== null; }
 export function isEnabled(): boolean { return enabled && profile !== null; }
 /** True when the access token is expired or about to be: refresh before opening a socket with it. */
 export function accessTokenStale(): boolean {
@@ -167,23 +202,34 @@ function validateRedeem(value: unknown, expectedBrowserId: string): EnrollRedeem
   return raw as unknown as EnrollRedeemResponse;
 }
 
-async function saveProfile(next: V8Profile): Promise<void> {
+/** Store a profile. `replacing` marks a different login (new code), which starts a new generation. */
+async function saveProfile(next: V8Profile, replacing = false): Promise<void> {
+  if (replacing) generation++;
   profile = next;
   lastAddress = next.addressOrigin;
   await chrome.storage.local.set({ [PROFILE_KEY]: next, [LAST_ADDRESS_KEY]: next.addressOrigin });
+  await chrome.storage.local.remove(TERMINAL_KEY);
 }
 
 /**
  * Drop the profile (credentials) and close the socket. The last address stays in storage and in the
- * snapshot so the re-connect form comes back filled in; only `reset` forgets it.
+ * snapshot so the re-connect form comes back filled in; only `reset` forgets it. A terminal state
+ * (login ended, address error) is stored with its reason, so it survives a worker restart.
  */
 async function clearProfile(nextError: string | null, nextState: AuthState): Promise<void> {
+  generation++;
   clearRefreshTimer();
   profile = null;
   error = nextError;
   retryReason = null;
   nextRetryAt = null;
-  await chrome.storage.local.remove(PROFILE_KEY);
+  outageStartedAt = null;
+  await chrome.storage.local.remove([PROFILE_KEY, OUTAGE_KEY]);
+  if (nextState === "login_ended" || nextState === "address_error") {
+    await chrome.storage.local.set({ [TERMINAL_KEY]: { state: nextState, error: nextError } });
+  } else {
+    await chrome.storage.local.remove(TERMINAL_KEY);
+  }
   hooks?.closeSocket();
   setState(nextState);
 }
@@ -197,17 +243,25 @@ function scheduleRefresh(): void {
 
 export async function init(nextHooks: AuthHooks): Promise<void> {
   hooks = nextHooks;
-  const stored = await chrome.storage.local.get([PROFILE_KEY, ENABLED_KEY, NAME_KEY, LAST_CONNECTED_KEY, LAST_ADDRESS_KEY]) as Record<string, unknown>;
+  const stored = await chrome.storage.local.get([PROFILE_KEY, ENABLED_KEY, NAME_KEY, LAST_CONNECTED_KEY, LAST_ADDRESS_KEY, TERMINAL_KEY, OUTAGE_KEY]) as Record<string, unknown>;
   // The popup's switch (back in 6.0.2, as in 1.2.x) is stored: a Chrome the person switched off stays
   // off across browser restarts, with its profile kept so switching on needs no code.
   enabled = stored[ENABLED_KEY] !== false;
   deviceName = typeof stored[NAME_KEY] === "string" && stored[NAME_KEY].trim() ? String(stored[NAME_KEY]).slice(0, 40) : defaultDeviceName();
   lastConnectedAt = typeof stored[LAST_CONNECTED_KEY] === "number" ? stored[LAST_CONNECTED_KEY] : null;
   lastAddress = typeof stored[LAST_ADDRESS_KEY] === "string" ? stored[LAST_ADDRESS_KEY] : null;
+  outageStartedAt = typeof stored[OUTAGE_KEY] === "number" ? stored[OUTAGE_KEY] : null;
   if (!validProfile(stored.v8BrowserBridgeProfile)) {
     if (stored.v8BrowserBridgeProfile !== undefined) await chrome.storage.local.remove(PROFILE_KEY);
     profile = null;
-    setState("setup");
+    // A login that ended (or a changed address) before the worker restarted is still that, with its reason.
+    const terminal = stored[TERMINAL_KEY] as { state?: unknown; error?: unknown } | undefined;
+    if (terminal?.state === "login_ended" || terminal?.state === "address_error") {
+      error = typeof terminal.error === "string" ? terminal.error : null;
+      setState(terminal.state);
+    } else {
+      setState("setup");
+    }
     return;
   }
   profile = stored.v8BrowserBridgeProfile;
@@ -228,6 +282,23 @@ const SETUP_RETRY_MS = 1_000;
 
 /** Redeem the dashboard's short-lived code immediately; V8 never asks an AI to approve it. */
 export async function setup(address: string, setupCode: string, replace = false): Promise<void> {
+  // One submission at a time: a second one (a paste that also submits) is ignored while one is running.
+  if (setupAbort) return;
+  const attemptNo = ++setupAttempt;
+  const abort = setupAbort = new AbortController();
+  const cancelled = (): boolean => attemptNo !== setupAttempt;
+  try { await runSetup(address, setupCode, replace, abort.signal, cancelled); }
+  finally { if (!cancelled() || setupAbort === abort) setupAbort = null; }
+}
+
+/** The popup's "취소" on the re-connect form: an attempt in flight is dropped even if its code is accepted late. */
+export function cancelSetup(): void {
+  setupAttempt++;
+  setupAbort?.abort();
+  setupAbort = null;
+}
+
+async function runSetup(address: string, setupCode: string, replace: boolean, signal: AbortSignal, cancelled: () => boolean): Promise<void> {
   // Re-connecting (`replace`) must not touch the standing connection until the new code is redeemed:
   // a failure only reports its reason, and the state, profile and socket stay as they were.
   // Likewise after a login ended: the form stays "your login ended" with the reason of this attempt.
@@ -253,26 +324,34 @@ export async function setup(address: string, setupCode: string, replace = false)
   for (let attempt = 0; attempt < SETUP_ATTEMPTS && !response; attempt++) {
     if (attempt > 0) await new Promise(resolve => setTimeout(resolve, SETUP_RETRY_MS * attempt));
     try {
-      response = await fetch(new URL("/api/enroll/redeem", origin), {
+      response = await fetchWithin(new URL("/api/enroll/redeem", origin), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ setup_code: code, stable_browser_id: browserId }),
-      });
+      }, signal);
     } catch (cause) {
+      if (cancelled()) return;
       console.log("[bb auth] enrollment request failed", { origin, attempt: attempt + 1, reason: cause instanceof Error ? cause.message : String(cause) });
     }
   }
+  if (cancelled()) return;
   if (!response) {
     fail("주소에 연결할 수 없습니다. 주소가 맞는지, 이 PC가 서버에 접속할 수 있는지(예: Tailscale) 확인해 주세요", "address_error");
     return;
   }
   const body = await response.json().catch(() => null);
+  if (cancelled()) return;
   if (!response.ok) {
     fail(enrollmentError(response.status, body), /expired|used/.test(String((body as { error?: unknown } | null)?.error)) ? "expired" : "setup");
     return;
   }
-  try {
-    const redeemed = validateRedeem(body, browserId);
+  let redeemed: EnrollRedeemResponse;
+  try { redeemed = validateRedeem(body, browserId); }
+  catch (cause) { fail((cause as Error).message, "setup"); return; }
+  // Commit the new login unless this attempt was cancelled while the request was in flight: a
+  // cancelled attempt must not replace the standing connection, even with a valid code.
+  const committed = await serialized(async () => {
+    if (cancelled()) return false;
     await saveProfile({
       schemaVersion: 8,
       addressOrigin: origin,
@@ -282,14 +361,17 @@ export async function setup(address: string, setupCode: string, replace = false)
       accessToken: redeemed.access_token ?? null,
       refreshToken: redeemed.refresh_token ?? null,
       tokenExpiresAt: redeemed.expires_in ? Date.now() + redeemed.expires_in * 1_000 : null,
-    });
-  } catch (cause) {
-    fail((cause as Error).message, "setup");
-    return;
-  }
-  // Redeemed: a new code also means the person wants it on, and the old socket (if any) goes.
-  enabled = true;
-  await chrome.storage.local.set({ [ENABLED_KEY]: true });
+    }, true);
+    // Redeemed: a new code also means the person wants it on, and the old socket (if any) goes.
+    enabled = true;
+    retryReason = null;
+    nextRetryAt = null;
+    outageStartedAt = null;
+    await chrome.storage.local.set({ [ENABLED_KEY]: true });
+    await chrome.storage.local.remove(OUTAGE_KEY);
+    return true;
+  });
+  if (!committed) return;
   hooks?.closeSocket();
   scheduleRefresh();
   setState("connecting");
@@ -324,10 +406,12 @@ export async function setEnabled(next: boolean): Promise<void> {
 
 /** The popup's "연결 정보 지우기": forget the profile, the address and the last-connected time. */
 export async function reset(): Promise<void> {
-  lastAddress = null;
-  lastConnectedAt = null;
-  await chrome.storage.local.remove([LAST_ADDRESS_KEY, LAST_CONNECTED_KEY]);
-  await clearProfile(null, "setup");
+  await serialized(async () => {
+    lastAddress = null;
+    lastConnectedAt = null;
+    await chrome.storage.local.remove([LAST_ADDRESS_KEY, LAST_CONNECTED_KEY]);
+    await clearProfile(null, "setup");
+  });
 }
 
 /**
@@ -343,14 +427,26 @@ export async function setDeviceName(raw: string): Promise<void> {
   notify();
   if (isEnabled()) hooks?.announceName?.(name);
 }
-export function markRetry(at: number | null, reason: ConnectionIssue | null = null): void { nextRetryAt = at; retryReason = reason; notify(); }
+export function markRetry(at: number | null, reason: ConnectionIssue | null = null): void {
+  nextRetryAt = at;
+  retryReason = reason;
+  // The outage starts at the first failure after being connected (or since the start), not at the
+  // last socket open: "unreachable for 3 days" is measured from here.
+  if (outageStartedAt === null && reason !== null) {
+    outageStartedAt = Date.now();
+    void chrome.storage.local.set({ [OUTAGE_KEY]: outageStartedAt });
+  }
+  notify();
+}
 export function markConnecting(): void { if (isEnabled()) setState("connecting"); }
 export function markConnected(): void {
   if (!isEnabled()) return;
   lastConnectedAt = Date.now();
   nextRetryAt = null;
   retryReason = null;
+  outageStartedAt = null;
   void chrome.storage.local.set({ [LAST_CONNECTED_KEY]: lastConnectedAt });
+  void chrome.storage.local.remove(OUTAGE_KEY);
   setState("connected");
 }
 
@@ -364,66 +460,83 @@ function defaultDeviceName(): string {
 /** Relay binding is checked on every socket, stopping a stale endpoint from becoming another person's relay. */
 export async function onRelayBinding(binding: string): Promise<boolean> {
   if (profile && binding !== profile.relayBinding) {
-    // The old address is the wrong one now, so it is not kept for the form.
-    lastAddress = null;
-    await chrome.storage.local.remove(LAST_ADDRESS_KEY);
-    await clearProfile("연결 주소가 변경되었습니다. 대시보드의 새 주소와 코드로 다시 설정하세요", "address_error");
+    await serialized(async () => {
+      // The old address is the wrong one now, so it is not kept for the form.
+      lastAddress = null;
+      await chrome.storage.local.remove(LAST_ADDRESS_KEY);
+      await clearProfile("연결 주소가 변경되었습니다. 대시보드의 새 주소와 코드로 다시 설정하세요", "address_error");
+    });
     return false;
   }
   return profile !== null;
 }
 
 /** Retry later after a refresh the network or the server could not answer (30 s), and say so in the popup. */
-function retryRefreshLater(): void {
+function retryRefreshLater(forGeneration: number): void {
+  if (forGeneration !== generation) return;
   clearRefreshTimer();
   refreshTimer = setTimeout(() => void refreshAccessToken(), REFRESH_RETRY_MS);
   markRetry(Date.now() + REFRESH_RETRY_MS, "unreachable");
 }
 
 /**
- * Exchange the refresh token for a new access token (and, from a 6.0.2 relay, a rotated refresh token,
- * which replaces the stored one). Concurrent callers (timer, 4401, a socket about to open) share one
- * request: with rotation a second request would present a token that was just replaced.
+ * Exchange the refresh token for a new access token and a rotated refresh token (the request says it can
+ * store one, which is what makes a 6.0.2 relay rotate; an older relay ignores the field and sends none).
+ * Callers at once (timer, 4401, a socket about to open, the alarm) share one request per login generation:
+ * with rotation a second request would present a token that was just replaced.
  */
 export function refreshAccessToken(): Promise<boolean> {
-  refreshing ??= doRefresh().finally(() => { refreshing = null; });
-  return refreshing;
+  if (refreshing && refreshing.generation === generation) return refreshing.promise;
+  const started = generation;
+  const promise: Promise<boolean> = doRefresh(started).finally(() => { if (refreshing?.promise === promise) refreshing = null; });
+  refreshing = { generation: started, promise };
+  return promise;
 }
 
-async function doRefresh(): Promise<boolean> {
-  if (!profile?.refreshToken) return false;
+async function doRefresh(started: number): Promise<boolean> {
+  const used = profile;
+  if (!used?.refreshToken) return false;
   let response: Response;
   try {
-    response = await fetch(new URL("/api/auth/refresh", profile.addressOrigin), {
+    response = await fetchWithin(new URL("/api/auth/refresh", used.addressOrigin), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ refresh_token: profile.refreshToken }),
+      body: JSON.stringify({ refresh_token: used.refreshToken, accepts_rotation: true }),
     });
   } catch {
-    retryRefreshLater();
+    retryRefreshLater(started);
     return false;
   }
+  // Whatever came back concerns the login this request started with; if that login was replaced or
+  // dropped meanwhile (a new code, reset), the outcome is discarded.
+  if (started !== generation) return false;
   if (response.status === 401) {
-    await clearProfile(null, "login_ended");
+    await serialized(async () => { if (started === generation) await clearProfile(null, "login_ended"); });
     return false;
   }
   if (!response.ok) {
-    retryRefreshLater();
+    retryRefreshLater(started);
     return false;
   }
-  const token = await response.json() as TokenResponse;
-  if (!token.access_token || token.token_type !== "bearer" || typeof token.expires_in !== "number") {
-    await clearProfile("relay 인증 응답이 올바르지 않습니다", "address_error");
+  let token: TokenResponse;
+  try { token = await response.json() as TokenResponse; }
+  catch { retryRefreshLater(started); return false; }
+  if (!token || typeof token.access_token !== "string" || !token.access_token || token.token_type !== "bearer" || typeof token.expires_in !== "number") {
+    retryRefreshLater(started); // a garbled answer is retried; it is not a reason to forget the login
     return false;
   }
-  if (!profile) return false; // reset or re-connected while the request was in flight
-  // A 6.0.2 relay rotates: keep the new refresh token (its 30 days start now). An older relay sends none.
-  await saveProfile({
-    ...profile,
-    accessToken: token.access_token,
-    refreshToken: typeof token.refresh_token === "string" && token.refresh_token ? token.refresh_token : profile.refreshToken,
-    tokenExpiresAt: Date.now() + token.expires_in * 1_000,
+  const committed = await serialized(async () => {
+    if (started !== generation || !profile) return false;
+    // A rotating relay sends a new refresh token (its 30 days start now): keep it. An older one sends none.
+    await saveProfile({
+      ...profile,
+      accessToken: token.access_token,
+      refreshToken: typeof token.refresh_token === "string" && token.refresh_token ? token.refresh_token : profile.refreshToken,
+      tokenExpiresAt: Date.now() + token.expires_in * 1_000,
+    });
+    return true;
   });
+  if (!committed) return false;
   scheduleRefresh();
   if (profile && enabled) hooks?.openSocket();
   return true;
