@@ -170,7 +170,42 @@ try {
   assert.equal((await call("/browsers")).body.switched_off, undefined);
   assert.ok(JSON.parse(readFileSync(join(temp, "state/switched-off.json"), "utf8")).entries.sleepy === undefined);
   console.log("  PASS  switching it back on clears the stored record (503 no_extension after a restart)");
-  console.log("\n8 passed");
+
+  // Expired records are pruned while the relay keeps running, and the file is rewritten.
+  const [wsPort2, httpPort2] = [await free(), await free()];
+  mkdirSync(join(temp, "state2"), { recursive: true });
+  const short = spawn(process.execPath, [join(root, "node_modules/tsx/dist/cli.mjs"), "server/index.ts"], {
+    cwd: root,
+    env: { ...process.env, BB_V6_TOKENS_FILE: join(temp, "state2/tokens.json"), BRIDGE_BIND_HOST: "127.0.0.1", BRIDGE_WS_PORT: String(wsPort2),
+      BRIDGE_HTTP_PORT: String(httpPort2), BRIDGE_TRUST_LOCAL: "1", BB_SWITCHED_OFF_KEEP_MS: "1500" },
+    stdio: "ignore",
+  });
+  try {
+    const secret2Path = join(temp, "state2/http-control.secret");
+    for (let i = 0; i < 100 && !existsSync(secret2Path); i++) await sleep(100);
+    const secret2 = readFileSync(secret2Path, "utf8").trim();
+    let shortSocket;
+    for (let attempt = 0; ; attempt++) {
+      shortSocket = new WebSocket(`ws://127.0.0.1:${wsPort2}/ws?id=short&name=Short`, { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
+      if (await new Promise(resolve => { shortSocket.once("open", () => resolve(true)); shortSocket.once("error", () => resolve(false)); })) break;
+      if (attempt >= 50) throw new Error("second relay did not start");
+      await sleep(200);
+    }
+    const goneShort = closed(shortSocket);
+    shortSocket.send(JSON.stringify({ type: "extension_switched_off" }));
+    shortSocket.close();
+    await goneShort;
+    const list2 = () => fetch(`http://127.0.0.1:${httpPort2}/browsers`, { headers: { "x-dccb-relay-secret": secret2 } }).then(response => response.json());
+    await sleep(300);
+    assert.equal((await list2()).switched_off?.[0].id, "short");
+    await sleep(2500);
+    assert.equal((await list2()).switched_off, undefined, "the expired record is gone without a restart");
+    assert.deepEqual(JSON.parse(readFileSync(join(temp, "state2/switched-off.json"), "utf8")).entries, {});
+    console.log("  PASS  expired switched-off records are pruned while running and the file is rewritten");
+  } finally {
+    short.kill("SIGTERM");
+  }
+  console.log("\n9 passed");
 } finally {
   relay.kill("SIGTERM");
   await sleep(300);

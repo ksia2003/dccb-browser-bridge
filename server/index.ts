@@ -123,7 +123,8 @@ const switchedOff = new Map<string, { name: string; at: string; address?: string
  * older than SWITCHED_OFF_KEEP_MS (a Chrome that was removed) is dropped.
  */
 const SWITCHED_OFF_FILE = join(STATE_DIR, "switched-off.json");
-const SWITCHED_OFF_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+/** Test hook: BB_SWITCHED_OFF_KEEP_MS shortens the 30-day keep time. */
+const SWITCHED_OFF_KEEP_MS = Number(process.env.BB_SWITCHED_OFF_KEEP_MS) || 30 * 24 * 60 * 60 * 1000;
 /**
  * The file holds the records and, separately, which browser LEFT last (`lastGone`, an id or null), so a
  * restart does not turn "this PC dropped" (no_extension) into "the person switched it off" just
@@ -158,7 +159,7 @@ function pruneSwitchedOff(): void {
   }
   if (changed) saveSwitchedOff();
 }
-setInterval(pruneSwitchedOff, 10 * 60 * 1000).unref();
+setInterval(pruneSwitchedOff, Math.min(10 * 60 * 1000, Math.max(200, SWITCHED_OFF_KEEP_MS / 4))).unref();
 /** Test hook: how long a socket may stay silent before the relay closes it. */
 const SILENCE_TIMEOUT_MS = Number(process.env.BB_HEARTBEAT_TIMEOUT_MS) || RELAY_SILENCE_TIMEOUT_MS;
 /** The browser whose socket closed last, if the person switched it off; any other last departure clears it. */
@@ -487,12 +488,19 @@ function handleConnection(
   // pipes would stay "open" for an engine that talks to nobody.
   // Monotonic clock: a wall-clock jump must not read as silence.
   let lastFrameAt = performance.now();
+  const checkEvery = Math.min(HEARTBEAT_INTERVAL_MS, Math.max(250, SILENCE_TIMEOUT_MS / 4));
+  let lastCheckAt = performance.now();
   const silenceWatch = setInterval(() => {
-    if (performance.now() - lastFrameAt > SILENCE_TIMEOUT_MS) {
+    const now = performance.now();
+    // This check itself ran far too late (the process was paused, the host suspended): the extension's
+    // pings could not be read in that time, so give it a fresh window instead of reading the pause as silence.
+    if (now - lastCheckAt > checkEvery * 3) lastFrameAt = now;
+    lastCheckAt = now;
+    if (now - lastFrameAt > SILENCE_TIMEOUT_MS) {
       log(`extension ${id} silent for over ${Math.round(SILENCE_TIMEOUT_MS / 1000)} s; closing the dead socket`);
       ws.terminate();
     }
-  }, Math.min(HEARTBEAT_INTERVAL_MS, Math.max(250, SILENCE_TIMEOUT_MS / 4)));
+  }, checkEvery);
 
   ws.on("message", (data) => {
     // A connection whose login ended or was replaced accepts no more work from the extension.
