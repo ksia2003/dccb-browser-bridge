@@ -164,6 +164,16 @@ function migrateEntry(entry: TokenEntry): TokenEntry {
   const person = entry.enrollmentBinding?.person;
   const prefix = person === undefined ? null : `v8-${person}-`;
   if (entry.browserId === undefined && prefix && entry.clientId.startsWith(prefix)) entry.browserId = entry.clientId.slice(prefix.length);
+  // A rotation the previous relay committed (just before this one took over, inside the grace) carries
+  // `rotationAccess` instead of `rotationResult`: keep the record usable, or the browser's retry would be
+  // refused and the extension would drop its login.
+  const legacy = entry as TokenEntry & { rotationAccess?: string };
+  if (legacy.rotationAccess !== undefined) {
+    if (entry.rotatedTo && !entry.rotationResult) {
+      entry.rotationResult = { access_token: legacy.rotationAccess, refresh_token: entry.rotatedTo, expires_in: ACCESS_TOKEN_TTL_S };
+    }
+    delete legacy.rotationAccess;
+  }
   return entry;
 }
 

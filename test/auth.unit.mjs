@@ -130,6 +130,25 @@ try {
   check("a stored entry without browserId is migrated at load", migrated.checkWsBearer({ subprotocols: ["bb-bearer.oldA"], trustLocal: false }).browserId === "oldbrowser");
   process.env.BB_V6_TOKENS_FILE = tokensFile;
 
+  // A rotation the previous relay committed inside the grace (legacy field names) still answers a retry.
+  const legacyFile = join(temp, "legacy-tokens.json");
+  const soon = Date.now() + 2 * 60_000;
+  const legacyBase = { clientId: "v8-alice-legacybrowser", browserId: "legacybrowser", createdAt: 1, family: 5, enrollmentBinding: binding() };
+  writeFileSync(legacyFile, JSON.stringify({
+    accessTokens: { legacyA1: { ...legacyBase, expiresAt: Date.now() + 3600_000 } },
+    refreshTokens: {
+      legacyR0: { ...legacyBase, expiresAt: soon, rotatedTo: "legacyR1", rotationAccess: "legacyA1" },
+      legacyR1: { ...legacyBase, expiresAt: Date.now() + 30 * D },
+    },
+  }));
+  process.env.BB_V6_TOKENS_FILE = legacyFile;
+  const upgraded = await import("../server/auth.ts?legacy=1");
+  upgraded.loadTokensFromDisk();
+  const retry = upgraded.handleRefresh({ refresh_token: "legacyR0", accepts_rotation: true });
+  check("a rotation record written by the previous relay (rotationAccess) still answers a retry after the upgrade",
+    retry.status === 200 && retry.body.access_token === "legacyA1" && retry.body.refresh_token === "legacyR1", JSON.stringify(retry));
+  process.env.BB_V6_TOKENS_FILE = tokensFile;
+
   // The store is written before success is answered.
   if (process.getuid?.() !== 0) {
     const victim = issue("v8-alice-browser5", binding());
