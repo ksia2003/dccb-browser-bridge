@@ -13,12 +13,13 @@ interface PopupSnapshot {
   lastConnectedAt: number | null;
   nextRetryAt: number | null;
   retryReason: "unreachable" | "dropped" | "silent" | null;
+  outageStartedAt: number | null;
   working: boolean;
   page: { title: string; url: string; favIconUrl: string | null } | null;
   siteAccess: boolean;
 }
 type Request =
-  | { type: "getState" | "focusTarget" | "reset" }
+  | { type: "getState" | "focusTarget" | "reset" | "cancelSetup" }
   | { type: "setup" | "reconnect"; address: string; code: string }
   | { type: "setEnabled"; enabled: boolean }
   | { type: "setDeviceName"; name: string };
@@ -84,7 +85,7 @@ function render(s: PopupSnapshot): void {
     : s.state === "connected" ? { cls: "ok", icon: "#check", title: "연결됨", desc: "AI가 필요할 때 뒤쪽 탭에서 일합니다.\n내 탭은 건드리지 않습니다." }
     : { cls: "idle", icon: "#sync", title: "", desc: "" };
   if (look.cls === "idle") {
-    const detail = describeConnecting({ lastConnectedAt: s.lastConnectedAt, nextRetryAt: s.nextRetryAt, retryReason: s.retryReason, now: Date.now() });
+    const detail = describeConnecting({ lastConnectedAt: s.lastConnectedAt, outageStartedAt: s.outageStartedAt, nextRetryAt: s.nextRetryAt, retryReason: s.retryReason, now: Date.now() });
     look.title = detail.title;
     look.desc = detail.desc;
   }
@@ -140,7 +141,7 @@ function render(s: PopupSnapshot): void {
 function renderDetail(s: PopupSnapshot): void {
   const box = byId("detail");
   const connecting = s.state === "connecting" && !s.working;
-  const { rows } = describeConnecting({ lastConnectedAt: s.lastConnectedAt, nextRetryAt: s.nextRetryAt, retryReason: s.retryReason, now: Date.now() });
+  const { rows } = describeConnecting({ lastConnectedAt: s.lastConnectedAt, outageStartedAt: s.outageStartedAt, nextRetryAt: s.nextRetryAt, retryReason: s.retryReason, now: Date.now() });
   box.hidden = !connecting || rows.length === 0;
   box.replaceChildren(...rows.map(row => {
     const line = document.createElement("div");
@@ -171,6 +172,8 @@ function closeMenu(): void {
 }
 
 function connect(): void {
+  // One submission at a time, whichever entry started it (button, Enter, a paste that fills both fields).
+  if (pending) return;
   const setupError = byId("setup-error");
   if (!address.value.trim() || !code.value.trim()) {
     setupError.hidden = false;
@@ -196,6 +199,8 @@ byId("reconnect").addEventListener("click", () => {
   code.focus();
 });
 byId("cancel").addEventListener("click", () => {
+  // An attempt already sent is cancelled in the worker too: it must not replace the connection if its code is accepted late.
+  if (pending) void ask({ type: "cancelSetup" });
   reconnecting = false;
   if (last) render(last);
 });

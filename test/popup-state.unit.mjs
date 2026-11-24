@@ -4,7 +4,7 @@
  */
 import { badgeFor, updateAvailable } from "../entrypoints/lib/badge.ts";
 import { describeConnecting, formatAgo, formatIn } from "../entrypoints/lib/connection-detail.ts";
-import { heartbeatAction } from "../entrypoints/lib/heartbeat.ts";
+import { heartbeatTick, STALL_MS } from "../entrypoints/lib/heartbeat.ts";
 import { EXTENSION_SILENCE_TIMEOUT_MS, HEARTBEAT_INTERVAL_MS, RELAY_SILENCE_TIMEOUT_MS } from "../shared/protocol.ts";
 
 let passed = 0;
@@ -47,8 +47,25 @@ check("long unreachable: 3 days ago, not reachable", d.title === "서버에 연�
 check("rows are labelled, never a dotted chain", ![d.title, d.desc, ...d.rows.map(r => r.value)].some(t => t.includes("·")));
 check("time wording", formatAgo(10_000) === "방금" && formatAgo(61_000 * 5) === "5분 전" && formatAgo(3 * 3600_000) === "3시간 전" && formatIn(0) === "지금 시도하는 중" && formatIn(90_000) === "2분 뒤");
 
-// Heartbeat rule and its stated timeouts.
-check("heartbeat: a recent frame pings, a long silence drops", heartbeatAction(now, now + HEARTBEAT_INTERVAL_MS) === "ping" && heartbeatAction(now, now + EXTENSION_SILENCE_TIMEOUT_MS + 1) === "drop");
+// Outage wording counts from the outage start, not from the last socket open.
+d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, outageStartedAt: now - 30_000, nextRetryAt: now + 5_000, retryReason: "dropped", now });
+check("a connection that held for 3 days and dropped 30 s ago is a short gap, not a long outage", d.title === "다시 연결하는 중" && d.rows[0].value === "방금", JSON.stringify(d));
+d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, outageStartedAt: now - 20 * 60_000, nextRetryAt: now + 5_000, retryReason: "unreachable", now });
+check("20 minutes into the outage it is a long one, and the row says 20 minutes", d.title === "서버에 연결되지 않음" && d.rows[0].value === "20분 전", JSON.stringify(d));
+
+// Heartbeat rule and its stated timeouts, with timer stalls.
+const beat = (state, at) => heartbeatTick(state, at);
+let hb = { lastInboundAt: now, lastTickAt: now, probeSince: null };
+let tick = beat(hb, now + HEARTBEAT_INTERVAL_MS);
+check("heartbeat: a recent frame pings", tick.action === "ping");
+hb = { lastInboundAt: now, lastTickAt: now + EXTENSION_SILENCE_TIMEOUT_MS - 1000, probeSince: null };
+check("heartbeat: steady ticks with a long silence drop the socket", beat(hb, now + EXTENSION_SILENCE_TIMEOUT_MS + 1000).action === "drop");
+hb = { lastInboundAt: now, lastTickAt: now, probeSince: null };
+tick = beat(hb, now + 5 * 60_000);
+check("a stalled tick (PC paused, clock jump) only probes with a ping", tick.action === "probe" && tick.state.probeSince === now + 5 * 60_000);
+check("a probe answered before the next tick keeps the connection", beat({ ...tick.state, lastInboundAt: tick.state.probeSince + 100 }, tick.state.probeSince + HEARTBEAT_INTERVAL_MS).action === "ping");
+check("a probe nobody answered drops it on the next tick", beat(tick.state, tick.state.probeSince + HEARTBEAT_INTERVAL_MS).action === "drop");
+check("a stall is more than a late-by-a-little tick", STALL_MS > HEARTBEAT_INTERVAL_MS && beat({ lastInboundAt: now, lastTickAt: now, probeSince: null }, now + HEARTBEAT_INTERVAL_MS + 3000).action === "ping");
 check("both timeouts are over two missed beats", EXTENSION_SILENCE_TIMEOUT_MS > 2 * HEARTBEAT_INTERVAL_MS && RELAY_SILENCE_TIMEOUT_MS > 2 * HEARTBEAT_INTERVAL_MS);
 
 console.log(`\n${passed} passed, ${failed} failed`);
