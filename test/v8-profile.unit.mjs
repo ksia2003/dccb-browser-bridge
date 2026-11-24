@@ -47,7 +47,7 @@ check("redeems exactly the pasted address and code without an AI approval round"
   && fetches[0].body.setup_code === "ABCDEFGH"
   && auth.wsUrl()?.startsWith("wss://door.example/ws?id="), JSON.stringify({ fetches, state: auth.snapshot() }));
 
-await auth.onRelayBinding("home:another-person:9");
+await auth.onRelayBinding("home:another-person:9", auth.connectionExpectation(), () => true);
 check("binding mismatch clears only V8 profile and requires explicit setup", auth.snapshot().state === "address_error"
   && !store.has("v8BrowserBridgeProfile")
   && store.get("relayHost") === "wrong-v6-host.example", JSON.stringify({ store: [...store], state: auth.snapshot() }));

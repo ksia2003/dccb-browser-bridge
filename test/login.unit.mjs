@@ -160,9 +160,72 @@ await auth.setup("https://door.example", "ABCD-EFGH", true);
 check("after a cancel a new attempt works", store.get("v8BrowserBridgeProfile").accessToken.startsWith("new-"));
 
 // An address error survives a worker restart with its reason.
-await auth.onRelayBinding("home:someone-else:9");
+await auth.onRelayBinding("home:someone-else:9", auth.connectionExpectation(), () => true);
 auth = await boot();
 check("an address error is still shown with its reason after a restart", auth.snapshot().state === "address_error" && /연결 주소가 변경/.test(auth.snapshot().error ?? ""), JSON.stringify(auth.snapshot()));
+
+// A delayed relay_binding from an OLD socket must not wipe a login that replaced it meanwhile.
+globalThis.fetch = async (url, init) => redeemOk(JSON.parse(init.body), "fresh");
+auth = await boot();
+await auth.setup("https://door.example", "ABCD-EFGH");
+const oldSocketExpectation = auth.connectionExpectation(); // captured when the old socket opened
+await auth.setup("https://door.example", "WXYZ-2345", true); // a new login replaces the profile
+const replacedProfile = JSON.stringify(store.get("v8BrowserBridgeProfile"));
+const staleBinding = await auth.onRelayBinding("home:someone-else:9", oldSocketExpectation, () => true);
+check("a stale binding from an old socket is ignored: the new login stays", staleBinding === false && JSON.stringify(store.get("v8BrowserBridgeProfile")) === replacedProfile && auth.snapshot().state === "connecting");
+const liveExpectation = auth.connectionExpectation();
+await auth.onRelayBinding("home:someone-else:9", liveExpectation, () => false);
+check("a mismatch reported by a socket that is no longer the current one wipes nothing", JSON.stringify(store.get("v8BrowserBridgeProfile")) === replacedProfile);
+check("a matching binding is accepted", await auth.onRelayBinding("home:alice:1", liveExpectation, () => true) === true);
+
+// A stalled response body is bounded by the deadline (headers AND body), and a refresh retries.
+const stalledBody = (signal) => new Response(new ReadableStream({ start(controller) { signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError"))); } }), { status: 200 });
+globalThis.fetch = async (_url, init) => stalledBody(init.signal);
+auth.timing.requestDeadlineMs = 80;
+const started = Date.now();
+const stalled = await auth.refreshAccessToken();
+check("a refresh whose body never arrives ends at the deadline and is retried later, not stuck", stalled === false && Date.now() - started < 1000 && auth.snapshot().retryReason === "unreachable" && auth.snapshot().state !== "login_ended");
+await auth.setup("https://door.example", "ABCD-EFGH", true).catch(() => {});
+check("a redeem whose body never arrives also ends (after its retries)", auth.snapshot().error?.includes("주소에 연결할 수 없습니다") ?? false, String(auth.snapshot().error));
+auth.timing.requestDeadlineMs = 15_000;
+
+// Cancel while waiting between redeem attempts sends nothing more.
+let redeemSent = 0;
+globalThis.fetch = async () => { redeemSent++; throw new TypeError("offline"); };
+const realSetTimeout = globalThis.setTimeout;
+const pendingBackoff = auth.setup("https://door.example", "ABCD-EFGH", true);
+await new Promise(resolve => realSetTimeout(resolve, 30));
+const sentBeforeCancel = redeemSent;
+auth.cancelSetup();
+await pendingBackoff;
+check("a cancel during the retry backoff stops the retries", redeemSent === sentBeforeCancel && sentBeforeCancel === 1, String(redeemSent));
+
+// Address errors and 6.0.0/6.0.1 profiles keep their address across a restart.
+globalThis.fetch = async () => { throw new TypeError("offline"); };
+auth = await boot();
+store.delete("v8BrowserBridgeProfile"); store.delete("v8BrowserBridgeTerminal"); store.delete("v8BrowserBridgeLastAddress");
+auth = await boot();
+auth.timing.requestDeadlineMs = 50;
+await auth.setup("https://nowhere.example", "ABCD-EFGH");
+auth.timing.requestDeadlineMs = 15_000;
+check("an unreachable setup address is an address_error", auth.snapshot().state === "address_error");
+auth = await boot();
+check("... and still is after a worker restart, with its reason", auth.snapshot().state === "address_error" && /주소에 연결할 수 없습니다/.test(auth.snapshot().error ?? ""));
+globalThis.fetch = async () => new Response("{}", { status: 401 });
+store.delete("v8BrowserBridgeTerminal"); store.delete("v8BrowserBridgeLastAddress");
+store.set("v8BrowserBridgeProfile", { schemaVersion: 8, addressOrigin: "https://old.example", wsEndpoint: "wss://old.example/ws", relayBinding: "home:alice:1", browserId: "c".repeat(32), accessToken: "x", refreshToken: "y", tokenExpiresAt: Date.now() - 1 });
+auth = await boot();
+check("a profile from 6.0.0/6.0.1 (no stored address) whose first refresh is refused keeps its address", auth.snapshot().state === "login_ended" && auth.snapshot().address === "https://old.example");
+auth = await boot();
+check("... also after a restart", auth.snapshot().state === "login_ended" && auth.snapshot().address === "https://old.example");
+
+// Switching off is not an outage.
+globalThis.fetch = async (url, init) => redeemOk(JSON.parse(init.body), "again");
+await auth.setup("https://door.example", "ABCD-EFGH");
+auth.markRetry(Date.now() + 1000, "unreachable");
+check("an outage start is recorded at the first failure", auth.snapshot().outageStartedAt !== null);
+await auth.setEnabled(false);
+check("switching off clears the outage (deliberate downtime is not counted)", auth.snapshot().outageStartedAt === null && auth.snapshot().retryReason === null && !store.has("v8BrowserBridgeOutageStart"));
 
 // Reset forgets everything stored for the connection.
 globalThis.fetch = async (url, init) => new Response(JSON.stringify({ ws_endpoint: "wss://door.example/ws", relay_binding: "home:alice:1", browser_id: JSON.parse(init.body).stable_browser_id,
