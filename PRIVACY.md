@@ -1,6 +1,6 @@
 # 개인정보 처리방침 · Privacy Policy
 
-DCCB Browser Bridge (Chrome 확장) · 시행일 2026-11-08 · Effective 2026-11-08 (6.0.0)
+DCCB Browser Bridge (Chrome 확장) · 시행일 2026-11-24 · Effective 2026-11-24 (6.0.2)
 
 [English below](#english)
 
@@ -11,7 +11,7 @@ DCCB Browser Bridge는 **사용자가 직접 운영하는 DCCB 서버(HOME)** �
 ### 다루는 정보와 쓰임
 - **AI가 연 탭의 웹페이지 내용**: AI가 요청할 때, AI가 직접 연 탭의 페이지 구조, 텍스트, 스크린샷, 네트워크 요청을 `chrome.debugger`로 읽어 사용자의 서버로 보냅니다. 사람이 쓰는 탭은 읽지 않습니다.
 - **로그인 쿠키를 쓰는 요청(fetch)**: AI가 요청하면 확장이 Chrome의 네트워크로 주소를 가져와 응답을 사용자의 서버로 보냅니다. 이때 그 사이트의 쿠키가 함께 갈 수 있습니다. 쿠키 값 자체를 읽거나 따로 보내지는 않습니다.
-- **연결 정보**: 서버 주소, 등록 토큰, 브라우저 식별자(무작위), 기기 이름, 마지막 연결 시각, 켜짐/꺼짐 같은 설정을 이 Chrome의 확장 저장소(`chrome.storage`)에 둡니다.
+- **연결 정보**: 서버 주소, 등록 토큰(로그인), 브라우저 식별자(무작위), 기기 이름, 마지막 연결 시각, 켜짐/꺼짐 같은 설정을 이 Chrome의 확장 저장소(`chrome.storage`)에 둡니다. 로그인이 끝났을 때 주소 칸을 채워 주려고 마지막 서버 주소도 남겨 둡니다.
 - **AI 탭 표시**: 어느 탭이 AI가 연 것인지, 사람이 그 탭을 봤는지를 이 Chrome 세션 동안만 기억합니다(크롬을 다시 켜면 사라짐).
 
 ### 하지 않는 것
@@ -21,11 +21,12 @@ DCCB Browser Bridge는 **사용자가 직접 운영하는 DCCB 서버(HOME)** �
 - 위에 적은 목적, 곧 사용자가 시킨 AI 웹 작업 말고는 쓰지 않습니다.
 
 ### 보관과 삭제
-- 확장 저장소의 정보는 확장을 지우면 함께 지워집니다. 팝업의 초기화로 서버 주소와 등록 토큰만 지울 수도 있습니다.
+- 확장 저장소의 정보는 확장을 지우면 함께 지워집니다. 팝업의 ⋮ 메뉴에서 "연결 정보 지우기"를 누르면(한 번 더 확인합니다) 서버 주소, 등록 토큰, 마지막 연결 시각을 지웁니다. 기기 이름과 무작위 브라우저 식별자는 남습니다. 서버에 있는 토큰은 그 서버에서 쓰지 않은 지 30일이 지나면 만료됩니다.
 - 사용자의 서버로 간 정보는 그 서버를 운영하는 사용자(또는 그 서버 관리자)가 관리합니다. 이 확장의 개발자는 그 서버에 접근하지 않습니다.
 
 ### 사용자가 할 수 있는 것
 - 크롬의 디버깅 표시줄에서 "취소"를 누르면 AI 작업이 바로 멈춥니다.
+- 팝업의 "AI가 이 Chrome 쓰기" 스위치를 끄면 서버와의 연결이 끊기고 AI 탭이 닫힙니다.
 - 크롬 확장 관리 화면(chrome://extensions)에서 언제든 확장을 끄거나 지울 수 있습니다.
 
 ### 문의
@@ -40,7 +41,7 @@ DCCB Browser Bridge lets the AI on **a DCCB server (HOME) that you run yourself*
 ### What it handles and why
 - **Web page content of tabs the AI opened**: when the AI asks, the extension reads the page structure, text, screenshots and network requests of the tabs the AI itself opened, through `chrome.debugger`, and sends them to your server. It does not read the tabs you use.
 - **Requests with your login cookies (fetch)**: when the AI asks, the extension fetches a URL through Chrome's network and sends the response to your server. The site's cookies may be sent with that request. The extension does not read or forward cookie values themselves.
-- **Connection data**: the server address, enrollment tokens, a random browser identifier, the device name, the last connection time and on/off settings are kept in this Chrome's extension storage (`chrome.storage`).
+- **Connection data**: the server address, enrollment tokens (the login), a random browser identifier, the device name, the last connection time and on/off settings are kept in this Chrome's extension storage (`chrome.storage`). The last server address is also kept so the address field can be filled in again when a login ends.
 - **Which tabs are the AI's**, and whether you have looked at them: remembered only for the current Chrome session (gone when Chrome restarts).
 
 ### What it does not do
@@ -50,11 +51,12 @@ DCCB Browser Bridge lets the AI on **a DCCB server (HOME) that you run yourself*
 - It uses data only for the purpose above: web tasks you ask your AI to do.
 
 ### Retention and deletion
-- Data in extension storage is removed when you remove the extension. The popup's reset removes only the server address and enrollment tokens.
+- Data in extension storage is removed when you remove the extension. The popup's "연결 정보 지우기" (Clear connection data, in the ⋮ menu, with a confirmation) removes the server address, the enrollment tokens and the last connection time; the device name and the random browser identifier stay. Tokens held by the server expire there after 30 days without use.
 - Data sent to your server is managed by you (or whoever runs that server). The extension's developer has no access to it.
 
 ### Your controls
 - Press "Cancel" on Chrome's debugging bar to stop AI work immediately.
+- Turn the popup's "AI가 이 Chrome 쓰기" switch off to disconnect from the server and close the AI's tabs.
 - Turn the extension off or remove it at any time in Chrome's extensions page (chrome://extensions).
 
 ### Contact
