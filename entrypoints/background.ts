@@ -12,15 +12,17 @@
  * module owns the socket and reports its lifecycle (open/close 4401) back to auth.
  */
 import type { BridgeMessage } from "../shared/protocol";
-import { isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
+import { EXTENSION_SILENCE_TIMEOUT_MS, HEARTBEAT_INTERVAL_MS, isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol";
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
 import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
+import type { ConnectionIssue } from "./lib/v8-auth";
+import { badgeFor, updateAvailable } from "./lib/badge";
+import { heartbeatAction } from "./lib/heartbeat";
 import "./lib/tools"; // side-effect: registers the tools into the registry
 
-const KEEPALIVE_MS = 20_000;
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 
@@ -41,6 +43,13 @@ let backoff = BACKOFF_MIN_MS;
  *  established connection. */
 let socketOpened = false;
 let latestExtensionVersion: string | null = null;
+/** When the relay last sent anything on the current socket; a socket silent for too long is dead. */
+let lastInboundAt = 0;
+/** A Web Store install carries update_url and Chrome updates it by itself; an unpacked copy does not.
+ *  (Read when needed, not at import: WXT imports this file in Node at build time, with no manifest.) */
+function installedFromStore(): boolean {
+  return Boolean((chrome.runtime.getManifest() as { update_url?: string }).update_url);
+}
 
 function log(...args: unknown[]): void {
   console.log("[bb bg]", ...args);
@@ -96,6 +105,14 @@ function openSocket(): void {
     return;
   }
 
+  // After a long sleep the stored access token is long expired: refresh first instead of presenting it
+  // (the relay rejects it, and the retry came 20 s late). The refresh opens the socket when it succeeds.
+  if (auth.accessTokenStale()) {
+    log("openSocket: access token expired or near expiry → refreshing first");
+    void auth.refreshAccessToken();
+    return;
+  }
+
   // V8 profile decides whether the redeemed route needs a bearer. The popup
   // never exposes a mode, host default, or another relay to choose from.
   const bearerRequired = auth.requiresBearer();
@@ -127,6 +144,7 @@ function openSocket(): void {
     if (socket !== openedSocket) return;
     log("connected");
     socketOpened = true;
+    lastInboundAt = Date.now();
     backoff = BACKOFF_MIN_MS;
     send({ type: "extension_hello", version: chrome.runtime.getManifest().version });
     // Connected is not declared until the relay echoes the profile's binding.
@@ -136,6 +154,7 @@ function openSocket(): void {
   });
 
   socket.addEventListener("message", (event) => {
+    lastInboundAt = Date.now();
     let msg: BridgeMessage;
     try {
       msg = JSON.parse(String(event.data)) as BridgeMessage;
@@ -152,7 +171,7 @@ function openSocket(): void {
     stopKeepalive();
     socket = null;
     closeAllPipes();
-    void handleClose(event.code);
+    void handleClose(event.code, socketOpened ? "dropped" : "unreachable");
   });
 
   socket.addEventListener("error", () => {
@@ -179,22 +198,22 @@ function closeSocket(): void {
   }
 }
 
-async function handleClose(code: number): Promise<void> {
+async function handleClose(code: number, issue: ConnectionIssue): Promise<void> {
   // Ask the auth machine what to do. 4401 → it refreshes + re-opens internally.
   const decision = await auth.onWsClosed(
     code === WS_CLOSE_UNAUTHORIZED ? WS_CLOSE_UNAUTHORIZED : code,
   );
   if (decision === "reconnect") {
-    scheduleReconnect();
+    scheduleReconnect(issue);
   }
   // "stop": either disabled, re-pairing, or auth already re-opened the socket.
 }
 
-function scheduleReconnect(): void {
+function scheduleReconnect(issue: ConnectionIssue = "unreachable"): void {
   if (!auth.isEnabled()) return;
   if (reconnectTimer !== null) clearTimeout(reconnectTimer);
   log("reconnecting in", backoff, "ms");
-  auth.markRetry(Date.now() + backoff);
+  auth.markRetry(Date.now() + backoff, issue);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     openSocket();
@@ -250,9 +269,28 @@ function send(msg: BridgeMessage): void {
   }
 }
 
+/**
+ * Heartbeat: ping every HEARTBEAT_INTERVAL_MS; the relay answers each with a pong. A socket that has
+ * received nothing for EXTENSION_SILENCE_TIMEOUT_MS is dead (PC slept, network gone without a close):
+ * drop it and reconnect. The relay applies the mirror rule to this side (server/index.ts).
+ */
 function startKeepalive(): void {
   stopKeepalive();
-  keepalive = setInterval(() => send({ type: "ping" }), KEEPALIVE_MS);
+  keepalive = setInterval(() => {
+    if (heartbeatAction(lastInboundAt, Date.now()) === "drop") { dropDeadSocket(); return; }
+    send({ type: "ping" });
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function dropDeadSocket(): void {
+  const dead = socket;
+  log("no frame from the relay for", EXTENSION_SILENCE_TIMEOUT_MS, "ms; dropping the dead socket");
+  stopKeepalive();
+  socket = null;
+  try { dead?.close(); } catch { /* already closing */ }
+  closeAllPipes();
+  // The close event of a dead socket may take minutes; it is ignored once `socket` was cleared.
+  scheduleReconnect("silent");
 }
 
 function stopKeepalive(): void {
@@ -265,7 +303,7 @@ function stopKeepalive(): void {
 // --- Popup ------------------------------------------------------------------
 
 interface PopupRequest {
-  type: "getState" | "setup" | "reconnect" | "setEnabled" | "setDeviceName" | "focusTarget";
+  type: "getState" | "setup" | "reconnect" | "setEnabled" | "setDeviceName" | "reset" | "focusTarget";
   enabled?: boolean;
   address?: string;
   code?: string;
@@ -284,6 +322,9 @@ async function popupSnapshot() {
     deviceName: snap.deviceName,
     version: chrome.runtime.getManifest().version,
     latestExtensionVersion,
+    lastConnectedAt: snap.lastConnectedAt,
+    nextRetryAt: snap.nextRetryAt,
+    retryReason: snap.retryReason,
     working,
     page: tab ? { title: tab.title ?? "", url: tab.url ?? "", favIconUrl: tab.favIconUrl ?? null } : null,
     // The person can limit the extension's site access in Chrome; only they can open it again.
@@ -291,11 +332,17 @@ async function popupSnapshot() {
   };
 }
 
-/** The toolbar badge: a dot while the AI works in this Chrome, nothing otherwise. */
+/** The toolbar badge: one mark at a time (lib/badge.ts): working dot, OFF, "!" not connected, NEW version. */
 function updateBadge(): void {
-  const working = pipeChannelCount() > 0;
-  void chrome.action.setBadgeText({ text: working ? " " : "" });
-  void chrome.action.setBadgeBackgroundColor({ color: "#6d5efc" });
+  const snap = auth.snapshot();
+  const mark = badgeFor({
+    working: pipeChannelCount() > 0,
+    state: snap.state,
+    retryReason: snap.retryReason,
+    updateAvailable: updateAvailable(chrome.runtime.getManifest().version, latestExtensionVersion, installedFromStore()),
+  });
+  void chrome.action.setBadgeText({ text: mark.text });
+  void chrome.action.setBadgeBackgroundColor({ color: mark.color });
 }
 
 function pushSnapshot(): void {
@@ -322,6 +369,18 @@ async function setEnabledByPerson(on: boolean): Promise<void> {
   pushSnapshot();
 }
 
+/**
+ * "연결 정보 지우기": forget the address and login. The AI loses this Chrome, so its work stops and its
+ * tabs close as with the off switch; the socket is closed (auth.reset), the relay's tokens simply expire.
+ */
+async function resetByPerson(): Promise<void> {
+  const tabIds = (await listAiTabs()).flatMap(entry => entry.tab.id === undefined ? [] : [entry.tab.id]);
+  await auth.reset(); // closes the socket (ends every pipe) and returns to "setup"
+  await setExecutionEnabled(false);
+  if (tabIds.length) await removeAiTabs(tabIds).catch(error => log("closing AI tabs failed", String(error)));
+  pushSnapshot();
+}
+
 function installPopupBridge(): void {
   chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse: (snapshot: unknown) => void): boolean => {
     const req = raw as PopupRequest;
@@ -342,6 +401,9 @@ function installPopupBridge(): void {
         return true;
       case "setDeviceName":
         void auth.setDeviceName(req.name ?? "").then(reply);
+        return true;
+      case "reset":
+        void resetByPerson().then(reply);
         return true;
       case "focusTarget":
         // The person asked to see the AI's tab; a Chrome error here is only logged.
@@ -405,6 +467,7 @@ export default defineBackground(() => {
     return auth.init({
       openSocket,
       closeSocket,
+      announceName: name => send({ type: "extension_rename", name }),
       onChange: snap => {
         void setExecutionEnabled(snap.state === "connected" || snap.state === "connecting");
         pushSnapshot();
