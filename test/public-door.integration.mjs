@@ -33,9 +33,11 @@ const origin = "https://home-box.example.ts.net";
 const homeHttp = createServer();
 const homeWss = new WebSocketServer({ noServer: true });
 const homeUpgradeOrigins = [];
+const homeUpgradeUrls = [];
 homeHttp.on("upgrade", (req, socket, head) => {
   if (new URL(req.url, "http://localhost").pathname !== "/ws") { socket.destroy(); return; }
   homeUpgradeOrigins.push(req.headers.origin);
+  homeUpgradeUrls.push(req.url);
   homeWss.handleUpgrade(req, socket, head, ws => {
     ws.send(JSON.stringify({ type: "relay_binding", relay_binding: "home:bob:home-box", browser_id: "public_door_browser_0001" }));
     ws.on("message", data => ws.send(data));
@@ -162,6 +164,43 @@ try {
   assert.equal(await nextMessage(client), JSON.stringify({ type: "ping" }));
   client.close();
   console.log("  PASS  public WebSocket terminates at the door and forwards frames only to its local HOME relay");
+
+  // The door verifies the id: a login enrolled for one browser cannot name another's, and the id
+  // forwarded to HOME is the enrolled one even when the caller sends none.
+  const refusedClaim = new WebSocket(`ws://127.0.0.1:${publicPort}/ws?id=some_other_browser_00000001`, [`bb-bearer.${refreshed.access_token}`]);
+  const refusedStatus = await new Promise((resolve, reject) => {
+    refusedClaim.once("unexpected-response", (_request, response) => { response.resume(); resolve(response.statusCode); });
+    refusedClaim.once("open", () => { refusedClaim.close(); resolve(101); });
+    refusedClaim.once("error", reject);
+  });
+  assert.equal(refusedStatus, 403);
+  const noClaim = new WebSocket(`ws://127.0.0.1:${publicPort}/ws`, [`bb-bearer.${refreshed.access_token}`]);
+  await new Promise((resolve, reject) => { noClaim.once("open", resolve); noClaim.once("error", reject); });
+  await nextMessage(noClaim);
+  assert.match(homeUpgradeUrls.at(-1), /[?&]id=public_door_browser_0001(&|$)/);
+  noClaim.close();
+  console.log("  PASS  the door binds the connection id to the enrolled browser and forwards the verified id");
+
+  // Re-enrolling the same browser: the newer login's admission ends the older login's connection at once,
+  // and its tokens are gone; before admission the older one keeps working.
+  const oldLive = new WebSocket(publicWsUrl, [`bb-bearer.${refreshed.access_token}`]);
+  await new Promise((resolve, reject) => { oldLive.once("open", resolve); oldLive.once("error", reject); });
+  await nextMessage(oldLive);
+  let oldCode = null;
+  oldLive.on("close", code => { oldCode = code; });
+  const issue2 = await (await fetch(`http://127.0.0.1:${issuerPort}/api/enroll/issue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ person: "bob", box_id: "home-box" }) })).json();
+  const profile2 = await (await fetch(`http://127.0.0.1:${publicPort}/api/enroll/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setup_code: issue2.setup_code, stable_browser_id: "public_door_browser_0001" }) })).json();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(oldCode, null, "issuing a new login alone does not end the old connection");
+  const newLive = new WebSocket(publicWsUrl, [`bb-bearer.${profile2.access_token}`]);
+  await new Promise((resolve, reject) => { newLive.once("open", resolve); newLive.once("error", reject); });
+  await nextMessage(newLive);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(oldCode, 4401, "admission of the newer login closed the older connection with 4401");
+  const staleRefresh = await fetch(`http://127.0.0.1:${publicPort}/api/auth/refresh`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ refresh_token: profile.refresh_token }) });
+  assert.equal(staleRefresh.status, 401);
+  newLive.close();
+  console.log("  PASS  re-enrolling: the older login ends at the newer one's admission");
 
   // Another account on the box reaches the issuer over loopback too; it must not get this person's code.
   const foreign = startPublicDoor({

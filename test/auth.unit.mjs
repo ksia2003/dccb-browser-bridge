@@ -1,15 +1,20 @@
 /**
- * 6.0.2 token lifecycle (server/auth.ts): refresh rotates the refresh token (new 30-day life, old one
- * revoked after a short grace that returns the same successor); a connection lives as long as its login,
- * not the 2 h access token; re-enrolling a browser retires its older logins once the new one is used.
+ * 6.0.2 token lifecycle (server/auth.ts): refresh rotates the refresh token only for a client that says
+ * it can store one (a 6.0.0/6.0.1 client keeps working, its token slid forward); a connection lives as
+ * long as its login, not the 2 h access token; a re-enrollment retires older logins only when it is
+ * ADMITTED, and tells their live connections at once; the id a bearer may use is the one it was enrolled
+ * for; the store is written atomically, owner-only, before success is answered.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const temp = mkdtempSync(join(tmpdir(), "bb-auth-"));
-process.env.BB_V6_TOKENS_FILE = join(temp, "tokens.json");
+const tokensFile = join(temp, "tokens.json");
+writeFileSync(tokensFile, "{}", { mode: 0o644 }); // a store left readable by an older relay
+process.env.BB_V6_TOKENS_FILE = tokensFile;
 const auth = await import("../server/auth.ts");
+auth.loadTokensFromDisk();
 
 let passed = 0;
 let failed = 0;
@@ -24,56 +29,96 @@ const advance = (ms) => { offset += ms; };
 const H = 3600_000;
 const D = 24 * H;
 const ws = (token) => auth.checkWsBearer({ subprotocols: [`bb-bearer.${token}`], trustLocal: false });
+const binding = (person = "alice") => ({ person, boxId: "box", relayBinding: "rb", homeWsEndpoint: "wss://x/ws" });
+const rotating = (refresh_token) => auth.handleRefresh({ refresh_token, accepts_rotation: true });
 
 try {
-  // Rotation.
-  const first = auth.issueEnrollmentTokens("v8-alice-browser1");
-  advance(10 * D);
-  const r1 = auth.handleRefresh({ refresh_token: first.refresh_token });
-  check("refresh returns a new access token and a NEW refresh token", r1.status === 200 && r1.body.refresh_token && r1.body.refresh_token !== first.refresh_token && r1.body.access_token);
-  const replay = auth.handleRefresh({ refresh_token: first.refresh_token });
-  check("the old refresh token inside the grace returns the same successor (lost response is recoverable)",
-    replay.status === 200 && replay.body.refresh_token === r1.body.refresh_token);
-  advance(6 * 60_000);
-  check("the old refresh token is revoked after the grace", auth.handleRefresh({ refresh_token: first.refresh_token }).status === 401);
+  check("the store file readable by others was tightened to 0600", (statSync(tokensFile).mode & 0o777) === 0o600);
 
-  // Daily use outlives the enrolment's 30 days.
+  // Rotation for a client that can store the new token.
+  const first = auth.issueEnrollmentTokens("v8-alice-browser1", binding());
+  check("a fresh store write is 0600 and leaves no temporary file", (statSync(tokensFile).mode & 0o777) === 0o600 && readdirSync(temp).every(name => !name.endsWith(".tmp")));
+  advance(10 * D);
+  const r1 = rotating(first.refresh_token);
+  check("a rotation-capable client gets a new access token AND a new refresh token", r1.status === 200 && r1.body.refresh_token && r1.body.refresh_token !== first.refresh_token && r1.body.access_token);
+  const fileBefore = readFileSync(tokensFile, "utf8");
+  const replay1 = rotating(first.refresh_token);
+  const replay2 = rotating(first.refresh_token);
+  check("a retry inside the grace returns the SAME result, mints nothing and does not rewrite the store",
+    replay1.status === 200 && replay1.body.refresh_token === r1.body.refresh_token && replay1.body.access_token === r1.body.access_token
+    && replay2.body.access_token === r1.body.access_token && readFileSync(tokensFile, "utf8") === fileBefore);
+  for (let i = 0; i < 10; i++) rotating(first.refresh_token);
+  check("grace retries are bounded", rotating(first.refresh_token).status === 401);
+  advance(6 * 60_000);
+  check("the old refresh token is revoked after the grace", rotating(first.refresh_token).status === 401);
+
   let token = r1.body.refresh_token;
   for (let day = 0; day < 40; day++) {
     advance(D);
-    const r = auth.handleRefresh({ refresh_token: token });
+    const r = rotating(token);
     if (r.status !== 200) { check(`daily refresh survives day ${day + 11}`, false, JSON.stringify(r)); break; }
     token = r.body.refresh_token;
   }
-  check("a browser refreshing daily is still logged in 50 days after enrolment", auth.handleRefresh({ refresh_token: token }).status === 200);
+  check("a browser refreshing daily is still logged in 50 days after enrolment", rotating(token).status === 200);
   advance(31 * D);
-  check("an unused login still ends after 30 days", auth.handleRefresh({ refresh_token: token }).status === 401);
+  check("an unused login still ends after 30 days", rotating(token).status === 401);
+
+  // A 6.0.0/6.0.1 client: sends no flag, stores only the access token, keeps its original refresh token.
+  const legacy = auth.issueEnrollmentTokens("v8-alice-legacy", binding());
+  let legacyOk = true;
+  for (let day = 0; day < 100; day++) {
+    advance(D);
+    const r = auth.handleRefresh({ refresh_token: legacy.refresh_token });
+    if (r.status !== 200 || "refresh_token" in r.body) { legacyOk = false; check(`a legacy client refreshes on day ${day}`, false, JSON.stringify(r)); break; }
+  }
+  check("a legacy client (no flag, original refresh token only) keeps refreshing for 100 days, long past enrolment, grace and 30 days", legacyOk);
+  advance(31 * D);
+  check("... and its login still ends when it is not used for 30 days", auth.handleRefresh({ refresh_token: legacy.refresh_token }).status === 401);
 
   // A connection follows its login, not the access token.
-  const login = auth.issueEnrollmentTokens("v8-alice-browser2");
+  const login = auth.issueEnrollmentTokens("v8-alice-browser2", binding());
   const opened = ws(login.access_token);
   const session = auth.sessionForAccessToken(login.access_token);
   advance(3 * H);
   check("the 2 h access token is expired", !auth.isAccessTokenValid(login.access_token));
   check("a live connection stays valid after its access token expired (login still alive)", opened.ok && session && auth.isSessionLive(session));
-  const refreshed = auth.handleRefresh({ refresh_token: login.refresh_token });
-  check("and after a refresh (rotation keeps the login)", auth.isSessionLive(session) && refreshed.status === 200);
+  check("and after a refresh", rotating(login.refresh_token).status === 200 && auth.isSessionLive(session));
   advance(31 * D);
   check("a connection ends when its login does", !auth.isSessionLive(session));
 
-  // Re-enrolling retires the older logins, but only once the new one is used.
-  const a = auth.issueEnrollmentTokens("v8-alice-browser3");
-  const other = auth.issueEnrollmentTokens("v8-alice-otherbrowser");
-  const b = auth.issueEnrollmentTokens("v8-alice-browser3");
-  check("issuing a new login alone leaves the old one working", ws(a.access_token).ok && auth.handleRefresh({ refresh_token: a.refresh_token }).status === 200);
-  check("the new login connects", ws(b.access_token).ok);
-  check("... and the older login is gone (access and refresh)", !ws(a.access_token).ok && auth.handleRefresh({ refresh_token: a.refresh_token }).status === 401);
-  check("another browser's login is untouched", ws(other.access_token).ok && auth.handleRefresh({ refresh_token: other.refresh_token }).status === 200);
-  const c = auth.issueEnrollmentTokens("v8-alice-browser3");
-  const viaRefresh = auth.handleRefresh({ refresh_token: c.refresh_token });
-  check("the first refresh of a newer login also retires the older ones", viaRefresh.status === 200 && auth.handleRefresh({ refresh_token: b.refresh_token }).status === 401);
+  // Re-enrolling retires older logins at admission, not at validation.
+  const a = auth.issueEnrollmentTokens("v8-alice-browser3", binding());
+  const sessionA = auth.sessionForAccessToken(a.access_token);
+  let told = 0;
+  auth.watchSession(sessionA, () => told++);
+  const other = auth.issueEnrollmentTokens("v8-alice-otherbrowser", binding());
+  const b = auth.issueEnrollmentTokens("v8-alice-browser3", binding());
+  check("issuing a new login leaves the old one working", ws(a.access_token).ok && auth.isSessionLive(sessionA));
+  check("validating the new login (an upgrade that may still be refused) retires nothing", ws(b.access_token).ok && ws(a.access_token).ok && told === 0);
+  check("admission activates it: the older login is gone (access and refresh) and its live connection is told at once",
+    auth.activateLogin(auth.sessionForAccessToken(b.access_token)) && told === 1 && !ws(a.access_token).ok && !auth.isSessionLive(sessionA) && rotating(a.refresh_token).status === 401);
+  check("another browser's login is untouched", ws(other.access_token).ok && rotating(other.refresh_token).status === 200);
+
+  // The id a bearer may use.
+  check("a bearer carries the browser id it was enrolled for", ws(b.access_token).browserId === "browser3" && ws(other.access_token).browserId === "otherbrowser");
+  const tricky = auth.issueEnrollmentTokens("v8-alice-x-victim", binding());
+  check("the browser id is exact, never a suffix guess", ws(tricky.access_token).browserId === "x-victim");
+
+  // The store is written before success is answered.
+  if (process.getuid?.() !== 0) {
+    const victim = auth.issueEnrollmentTokens("v8-alice-browser5", binding());
+    chmodSync(temp, 0o500);
+    let threw = false;
+    try { auth.issueEnrollmentTokens("v8-alice-browser6", binding()); } catch { threw = true; }
+    const failedRefresh = rotating(victim.refresh_token);
+    chmodSync(temp, 0o700);
+    check("when the store cannot be written, enrolment fails instead of handing out a login", threw);
+    check("... and a refresh answers 503, with the old refresh token still good afterwards", failedRefresh.status === 503 && rotating(victim.refresh_token).status === 200);
+  }
+  check("no leftover temporary files", readdirSync(temp).every(name => !name.endsWith(".tmp")) && existsSync(tokensFile));
 } finally {
   Date.now = realNow;
+  try { chmodSync(temp, 0o700); } catch {}
   rmSync(temp, { recursive: true, force: true });
 }
 console.log(`\n${passed} passed, ${failed} failed`);

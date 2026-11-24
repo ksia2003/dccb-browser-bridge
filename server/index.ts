@@ -40,6 +40,8 @@ import {
   enrollmentBindingForAccessToken,
   isSessionLive,
   sessionForAccessToken,
+  activateLogin,
+  watchSession,
   STATE_DIR,
   loadOrCreateHttpControlSecret,
   type AuthResult,
@@ -122,26 +124,41 @@ const switchedOff = new Map<string, { name: string; at: string; address?: string
  */
 const SWITCHED_OFF_FILE = join(STATE_DIR, "switched-off.json");
 const SWITCHED_OFF_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * The file holds the records and, separately, which browser LEFT last (`lastGone`, an id or null), so a
+ * restart does not turn "this PC dropped" (no_extension) into "the person switched it off" just
+ * because an older switched-off record exists.
+ */
 function loadSwitchedOff(): void {
   try {
-    const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as Record<string, { name?: unknown; at?: unknown; address?: unknown }>;
-    for (const [id, v] of Object.entries(data)) {
+    const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as { entries?: Record<string, { name?: unknown; at?: unknown; address?: unknown }>; lastGone?: unknown };
+    for (const [id, v] of Object.entries(data.entries ?? {})) {
       if (typeof v?.name !== "string" || typeof v.at !== "string" || !(Date.now() - Date.parse(v.at) < SWITCHED_OFF_KEEP_MS)) continue;
       switchedOff.set(id, { name: v.name, at: v.at, ...(typeof v.address === "string" ? { address: v.address } : {}) });
     }
+    lastGoneSwitchedOff = typeof data.lastGone === "string" && switchedOff.has(data.lastGone) ? data.lastGone : null;
   } catch { /* no record yet, or an unreadable one: start empty */ }
-  // The most recent switch-off stands in for "the last Chrome to leave" the relay lost track of in the restart.
-  const latest = [...switchedOff].sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at))[0];
-  if (latest) lastGoneSwitchedOff = latest[0];
 }
 function saveSwitchedOff(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
     const temporary = `${SWITCHED_OFF_FILE}.${process.pid}.tmp`;
-    writeFileSync(temporary, JSON.stringify(Object.fromEntries(switchedOff)), { mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify({ version: 2, entries: Object.fromEntries(switchedOff), lastGone: lastGoneSwitchedOff }), { mode: 0o600 });
     renameSync(temporary, SWITCHED_OFF_FILE);
   } catch (e) { log("could not save the switched-off record:", (e as Error).message); }
 }
+/** Drop records past SWITCHED_OFF_KEEP_MS while running too (a relay can stay up for months) and rewrite the file. */
+function pruneSwitchedOff(): void {
+  let changed = false;
+  for (const [id, v] of switchedOff) {
+    if (Date.now() - Date.parse(v.at) < SWITCHED_OFF_KEEP_MS) continue;
+    switchedOff.delete(id);
+    if (lastGoneSwitchedOff === id) lastGoneSwitchedOff = null;
+    changed = true;
+  }
+  if (changed) saveSwitchedOff();
+}
+setInterval(pruneSwitchedOff, 10 * 60 * 1000).unref();
 /** Test hook: how long a socket may stay silent before the relay closes it. */
 const SILENCE_TIMEOUT_MS = Number(process.env.BB_HEARTBEAT_TIMEOUT_MS) || RELAY_SILENCE_TIMEOUT_MS;
 /** The browser whose socket closed last, if the person switched it off; any other last departure clears it. */
@@ -331,7 +348,19 @@ wsHttp.on("upgrade", (req, socket, head) => {
   // Multi-browser identity: the extension MAY self-report `?id=&name=` (v5
   // style). When it doesn't (today's v6 extension supplies neither), assign a
   // short random id and derive a friendly name from the bearer's clientId.
-  const selfId = url.searchParams.get("id")?.trim() || undefined;
+  // A bearer connection's id is the browser id its login was enrolled for; one browser cannot take
+  // another's slot (and its switched-off record) by naming it. Only the tokenless same-box path
+  // (trusted-local, which includes the public door that has verified the id itself) self-reports.
+  let selfId = url.searchParams.get("id")?.trim() || undefined;
+  if (check.clientId !== "trusted-local") {
+    if (check.browserId && selfId && selfId !== check.browserId) {
+      log("WS rejected: id does not match the browser this login was enrolled for");
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    selfId = check.browserId;
+  }
   const selfName = url.searchParams.get("name")?.trim() || undefined;
 
   // `handleProtocols` (set on the WebSocketServer) already echoes the
@@ -391,6 +420,17 @@ function handleConnection(
       : `b-${randomUUID().slice(0, 8)}`);
   const name = identity.name || defaultBrowserName(id, identity.clientId);
 
+  // Admission: a bearer login must still be live, and only now does it replace the browser's earlier
+  // logins (auth.ts activateLogin). A connection of a replaced login is closed at once, not at a poll.
+  const bearer = extractBearer(req, subprotocols);
+  const session = bearer ? sessionForAccessToken(bearer) : null;
+  if (bearer && !session) { ws.close(WS_CLOSE_UNAUTHORIZED, "token_expired"); return; }
+  if (session && !activateLogin(session)) { ws.close(1011, "state_unwritable"); return; }
+  const unwatch = session ? watchSession(session, () => {
+    log(`login replaced by a newer enrollment; closing ${id}`);
+    ws.close(WS_CLOSE_UNAUTHORIZED, "login_replaced");
+  }) : null;
+
   // Multi-browser: accept this connection. If a browser with the SAME id is
   // already registered, drop the stale one (a reconnect of the same extension)
   // so we never keep a dead dupe. Different ids coexist.
@@ -414,8 +454,9 @@ function handleConnection(
     ...(from && from !== "127.0.0.1" && from !== "::1" ? { address: from } : {}),
   };
   browsers.set(id, entry);
-  if (switchedOff.delete(id)) saveSwitchedOff();
+  switchedOff.delete(id);
   lastGoneSwitchedOff = null;
+  saveSwitchedOff();
   log(`extension connected: ${id} (${name}); ${browsers.size} now connected`);
   const route = routeFromEnvironment();
   const latestExtensionVersion = refreshDistributedExtensionVersion();
@@ -431,8 +472,6 @@ function handleConnection(
   // token expired or superseded by a re-enrollment). The 2 h access token that opened the socket does
   // not bound it: the extension refreshes it over HTTP and keeps this socket, so work in progress
   // survives (6.0.2; 4401 at every access-token expiry used to end the AI's running work).
-  const bearer = extractBearer(req, subprotocols);
-  const session = bearer ? sessionForAccessToken(bearer) : null;
   let tokenWatch: ReturnType<typeof setInterval> | null = null;
   if (bearer) {
     tokenWatch = setInterval(() => {
@@ -446,16 +485,19 @@ function handleConnection(
   // Heartbeat: any frame from the extension counts; the extension pings every HEARTBEAT_INTERVAL_MS.
   // A socket that went silent (PC asleep, network gone without a FIN) never closes by itself, and its
   // pipes would stay "open" for an engine that talks to nobody.
-  let lastFrameAt = Date.now();
+  // Monotonic clock: a wall-clock jump must not read as silence.
+  let lastFrameAt = performance.now();
   const silenceWatch = setInterval(() => {
-    if (Date.now() - lastFrameAt > SILENCE_TIMEOUT_MS) {
+    if (performance.now() - lastFrameAt > SILENCE_TIMEOUT_MS) {
       log(`extension ${id} silent for over ${Math.round(SILENCE_TIMEOUT_MS / 1000)} s; closing the dead socket`);
       ws.terminate();
     }
   }, Math.min(HEARTBEAT_INTERVAL_MS, Math.max(250, SILENCE_TIMEOUT_MS / 4)));
 
   ws.on("message", (data) => {
-    lastFrameAt = Date.now();
+    // A connection whose login ended or was replaced accepts no more work from the extension.
+    if (session && !isSessionLive(session)) { ws.close(WS_CLOSE_UNAUTHORIZED, "login_ended"); return; }
+    lastFrameAt = performance.now();
     let msg: BridgeMessage;
     try {
       msg = JSON.parse(data.toString()) as BridgeMessage;
@@ -516,6 +558,7 @@ function handleConnection(
 
   ws.on("close", () => {
     if (tokenWatch) clearInterval(tokenWatch);
+    unwatch?.();
     clearInterval(silenceWatch);
     pipe.onBrowserClosed(ws);
     for (const [requestId, waiter] of pending) {
@@ -529,6 +572,7 @@ function handleConnection(
     if (browsers.get(id)?.ws === ws) {
       browsers.delete(id);
       lastGoneSwitchedOff = entry.switchedOffAt ? id : null;
+      saveSwitchedOff();
       log(`extension disconnected: ${id}; ${browsers.size} now connected`);
     }
   });
@@ -950,10 +994,17 @@ async function handleEnrollmentRedeem(req: IncomingMessage, res: ServerResponse)
   }
   log("enrollment redeemed");
   const route = result.value!;
-  const bearer = issueEnrollmentTokens(`v8-${route.person}-${route.browserId}`, {
-    person: route.person, boxId: route.boxId, relayBinding: route.relayBinding,
-    homeWsEndpoint: route.wsEndpoint,
-  });
+  let bearer;
+  try {
+    bearer = issueEnrollmentTokens(`v8-${route.person}-${route.browserId}`, {
+      person: route.person, boxId: route.boxId, relayBinding: route.relayBinding,
+      homeWsEndpoint: route.wsEndpoint,
+    });
+  } catch (error) {
+    log(`enrollment not completed: ${(error as Error).message}`);
+    writeJson(res, 503, { error: "server_error" });
+    return;
+  }
   const response: EnrollRedeemResponse = {
     ws_endpoint: route.wsEndpoint,
     relay_binding: route.relayBinding,

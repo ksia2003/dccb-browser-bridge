@@ -24,6 +24,8 @@ import {
   handleRefresh,
   isSessionLive,
   sessionForAccessToken,
+  activateLogin,
+  watchSession,
   issueEnrollmentTokens,
   type EnrollmentTokenBinding,
 } from "./auth.js";
@@ -267,7 +269,9 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
           relayBinding: route.relayBinding,
           homeWsEndpoint: route.homeWsEndpoint,
         };
-        const tokens = issueEnrollmentTokens(`v8-${route.person}-${redeemed.value!.browserId}`, binding);
+        let tokens;
+        try { tokens = issueEnrollmentTokens(`v8-${route.person}-${redeemed.value!.browserId}`, binding); }
+        catch { json(res, 503, { error: "server_error" }); return; }
         const response: EnrollRedeemResponse = {
           ws_endpoint: route.wsEndpoint,
           relay_binding: route.relayBinding,
@@ -282,7 +286,7 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
       void (async () => {
         const body = await readJson(req);
         if (!body) { json(res, 400, { error: "invalid_request" }); return; }
-        const result = handleRefresh(body as { refresh_token?: string });
+        const result = handleRefresh(body as { refresh_token?: string; accepts_rotation?: boolean });
         json(res, result.status, result.body);
       })();
       return;
@@ -318,6 +322,15 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
       socket.destroy();
       return;
     }
+    // The id the HOME relay will key this browser by is the one its login was enrolled for, never the
+    // caller's claim: a different claim is refused, and the verified id replaces the query's.
+    const claimed = url.searchParams.get("id")?.trim();
+    if (check.browserId && claimed && claimed !== check.browserId) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (check.browserId) url.searchParams.set("id", check.browserId);
     wss.handleUpgrade(req, socket, head, browser => bridgeToHome(browser, current, bearer, url));
   });
 
@@ -346,12 +359,21 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   if (browserName) homeUrl.searchParams.set("name", browserName);
   const home = new WebSocket(homeUrl, { maxPayload: 0 });
   let closed = false;
+  let admitted = false;
   // The connection lives as long as the login it was opened with, not the 2 h access token (auth.ts isSessionLive).
   const session = sessionForAccessToken(bearer);
   let watch: ReturnType<typeof setInterval> | null = setInterval(() => {
     if (!session || !isSessionLive(session)) close(WS_CLOSE_UNAUTHORIZED, "login_ended");
   }, 30_000);
-  const clearWatch = (): void => { if (watch) clearInterval(watch); watch = null; };
+  const clearWatch = (): void => { if (watch) clearInterval(watch); watch = null; unwatch?.(); };
+  // Admission: the HOME relay accepted this browser. Only now does the new login retire its predecessors,
+  // and a connection of a replaced login stops at once.
+  const unwatch = session ? watchSession(session, () => close(WS_CLOSE_UNAUTHORIZED, "login_replaced")) : null;
+  home.on("open", () => {
+    if (closed) return;
+    if (!session || !activateLogin(session)) { close(1011, "state_unwritable"); return; }
+    admitted = true;
+  });
   const close = (code: number, reason: string): void => {
     if (closed) return;
     closed = true;
@@ -364,7 +386,11 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   const forward = (target: WebSocket, data: RawData, isBinary: boolean): void => {
     if (target.readyState === WebSocket.OPEN) target.send(data, { binary: isBinary });
   };
-  browser.on("message", (data, isBinary) => forward(home, data, isBinary));
+  browser.on("message", (data, isBinary) => {
+    if (!admitted) return;
+    if (!session || !isSessionLive(session)) { close(WS_CLOSE_UNAUTHORIZED, "login_ended"); return; }
+    forward(home, data, isBinary);
+  });
   home.on("message", (data, isBinary) => forward(browser, data, isBinary));
   browser.on("close", () => close(1000, "browser_closed"));
   // 1005/1006/1015 report how a connection ended and are never sent in a frame.

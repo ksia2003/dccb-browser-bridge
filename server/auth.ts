@@ -24,6 +24,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -51,6 +52,7 @@ export const STATE_DIR = dirname(TOKENS_FILE);
  * would otherwise lock the browser out until a new code.
  */
 const ROTATION_GRACE_S = 5 * 60;
+const MAX_GRACE_REPLAYS = 5;
 
 /**
  * Create the HOME-local HTTP control credential beside the existing token
@@ -120,8 +122,15 @@ interface TokenEntry {
    * has a larger value. Absent on tokens written before 6.0.2 (treated as 0, oldest).
    */
   family?: number;
-  /** Set on a refresh token that was rotated: the refresh token that replaced it (see ROTATION_GRACE_S). */
+  /**
+   * Set on a refresh token that was rotated (see ROTATION_GRACE_S): the refresh token and the access
+   * token its rotation produced. A retry inside the grace gets exactly these back, so a lost response
+   * costs nothing and a retry loop mints nothing.
+   */
   rotatedTo?: string;
+  rotationAccess?: string;
+  /** In-memory count of grace retries served (bounded by MAX_GRACE_REPLAYS). */
+  replays?: number;
 }
 
 interface TokenFileData {
@@ -148,16 +157,53 @@ function log(...args: unknown[]): void {
 
 // --- Persistence ------------------------------------------------------------
 
-function persist(): void {
+/**
+ * Write the token store atomically and durably: a 0600 temporary file in the same folder, fsynced,
+ * renamed over the store, then the folder fsynced. Returns false on failure; callers that answer
+ * "success" to a client go through {@link transaction} so they never promise what is not on disk.
+ */
+function persist(): boolean {
+  const directory = dirname(TOKENS_FILE);
+  const temporary = `${TOKENS_FILE}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
     const data: TokenFileData = {
       accessTokens: Object.fromEntries(accessTokens),
       refreshTokens: Object.fromEntries(refreshTokens),
     };
-    writeFileSync(TOKENS_FILE, JSON.stringify(data, null, 2));
+    const descriptor = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeFileSync(descriptor, JSON.stringify(data, null, 2));
+      fchmodSync(descriptor, 0o600);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporary, TOKENS_FILE);
+    try {
+      const folder = openSync(directory, constants.O_RDONLY);
+      try { fsyncSync(folder); } finally { closeSync(folder); }
+    } catch { /* the rename is done; a folder fsync is best-effort on filesystems that refuse it */ }
+    return true;
   } catch (e) {
     log("failed to persist tokens:", (e as Error).message);
+    try { unlinkSync(temporary); } catch { /* never created */ }
+    return false;
   }
+}
+
+/** Run a change to the stores and commit it to disk; if the write fails the change is undone and false returned. */
+function transaction(change: () => void): boolean {
+  const before = {
+    access: new Map([...accessTokens].map(([k, v]) => [k, { ...v }] as const)),
+    refresh: new Map([...refreshTokens].map(([k, v]) => [k, { ...v }] as const)),
+  };
+  change();
+  if (persist()) return true;
+  accessTokens.clear(); refreshTokens.clear();
+  for (const [k, v] of before.access) accessTokens.set(k, v);
+  for (const [k, v] of before.refresh) refreshTokens.set(k, v);
+  return false;
 }
 
 export function loadTokensFromDisk(): void {
@@ -180,6 +226,7 @@ export function loadTokensFromDisk(): void {
         refresh++;
       } else skipped++;
     }
+    try { fchmodSync(openSync(TOKENS_FILE, constants.O_RDONLY | constants.O_NOFOLLOW), 0o600); } catch { /* best-effort tightening of a store written by an older relay */ }
     log(
       `loaded ${access} access, ${refresh} refresh tokens` +
         (skipped ? ` (skipped ${skipped} expired)` : ""),
@@ -195,28 +242,27 @@ function newToken(): string {
   return randomBytes(32).toString("hex");
 }
 
-/** Mint a bearer pair for a completed V8 enrollment, retaining its approved route on refresh. */
+/**
+ * Mint a bearer pair for a completed V8 enrollment, retaining its approved route on refresh.
+ * Throws when the store cannot be written: a login the relay could not record must not be handed out.
+ */
 export function issueEnrollmentTokens(clientId: string, enrollmentBinding?: EnrollmentTokenBinding): TokenResponse {
   const now = Date.now();
   const accessToken = newToken();
   const refreshToken = newToken();
   // Larger than any earlier login of this browser even if two redeems land in the same millisecond.
   const family = Math.max(now, latestFamily(clientId) + 1);
-  accessTokens.set(accessToken, {
-    clientId,
-    createdAt: now,
-    expiresAt: now + ACCESS_TOKEN_TTL_S * 1000,
-    family,
-    ...(enrollmentBinding ? { enrollmentBinding } : {}),
+  const committed = transaction(() => {
+    accessTokens.set(accessToken, {
+      clientId, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000, family,
+      ...(enrollmentBinding ? { enrollmentBinding } : {}),
+    });
+    refreshTokens.set(refreshToken, {
+      clientId, createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000, family,
+      ...(enrollmentBinding ? { enrollmentBinding } : {}),
+    });
   });
-  refreshTokens.set(refreshToken, {
-    clientId,
-    createdAt: now,
-    expiresAt: now + REFRESH_TOKEN_TTL_S * 1000,
-    family,
-    ...(enrollmentBinding ? { enrollmentBinding } : {}),
-  });
-  persist();
+  if (!committed) throw new Error("token store is not writable");
   return {
     access_token: accessToken,
     refresh_token: refreshToken,
@@ -235,11 +281,9 @@ function latestFamily(clientId: string): number {
 
 /**
  * Re-enrolling a browser (same clientId = person + stable browser id) leaves its earlier logins behind.
- * Once a newer login's token is actually used (a socket opened with it, or it refreshed), drop the
- * older ones, so a Chrome holds one login, not one per enrollment. Not done at issue time: until the
- * extension has stored and used the new pair, the old one is the only working connection.
+ * Removes them from the stores (the caller commits) and returns true when any went.
  */
-function retireOlderLogins(clientId: string, family: number): void {
+function retireOlderLogins(clientId: string, family: number): boolean {
   let changed = false;
   for (const map of [accessTokens, refreshTokens]) {
     for (const [key, entry] of map) {
@@ -249,7 +293,39 @@ function retireOlderLogins(clientId: string, family: number): void {
       }
     }
   }
-  if (changed) persist();
+  return changed;
+}
+
+interface SessionWatch { clientId: string; family: number; onEnd: () => void }
+const sessionWatches = new Set<SessionWatch>();
+
+/**
+ * Call `onEnd` the moment a newer login of the same browser replaces this connection's login, so a
+ * superseded connection stops forwarding at once instead of at the next poll. Returns the unsubscribe.
+ */
+export function watchSession(session: SessionHandle, onEnd: () => void): () => void {
+  const watch: SessionWatch = { ...session, onEnd };
+  sessionWatches.add(watch);
+  return () => { sessionWatches.delete(watch); };
+}
+
+function announceRetired(clientId: string, family: number): void {
+  for (const watch of [...sessionWatches]) {
+    if (watch.clientId === clientId && watch.family < family) watch.onEnd();
+  }
+}
+
+/**
+ * A new login becomes the browser's login only once it was ADMITTED (socket accepted after route
+ * validation). Then, and only then, its predecessors are deleted and their live connections told.
+ * False means the removal could not be written to disk: the caller must not admit the connection.
+ */
+export function activateLogin(session: SessionHandle): boolean {
+  let retired = false;
+  const committed = transaction(() => { retired = retireOlderLogins(session.clientId, session.family); });
+  if (!committed) return false;
+  if (retired) announceRetired(session.clientId, session.family);
+  return true;
 }
 
 /** Constant-time bearer lookup that resists timing-based token discovery. */
@@ -302,53 +378,67 @@ function err(status: number, code: string): AuthResult {
 }
 
 /**
- * POST /api/auth/refresh — exchange a refresh token for a new access token AND a new refresh token
- * (6.0.2). The refresh token is rotated: each use gives a fresh 30-day life, so a browser in daily use
- * never hits the 30-day wall of its enrollment day, and the old token stops working (after a short
- * grace that returns the same successor, see ROTATION_GRACE_S).
+ * POST /api/auth/refresh — exchange a refresh token for a new access token.
+ *
+ * A client that sends `accepts_rotation: true` (the 6.0.2 extension, which stores a new refresh token)
+ * gets a ROTATED refresh token: a fresh 30-day life, the old one revoked after a short grace. A client
+ * that does not send it (6.0.0/6.0.1, which keep only the access token and would be locked out by a
+ * rotation) keeps the old behaviour: only an access token comes back, and the refresh token it already
+ * holds is extended to 30 days from now. That sliding extension is safe: the token is the same secret
+ * bound to the same browser, and it lives no longer than "30 days since the owner last used it".
  */
-export function handleRefresh(body: { refresh_token?: string }): AuthResult {
+export function handleRefresh(body: { refresh_token?: string; accepts_rotation?: boolean }): AuthResult {
   if (!body.refresh_token) return err(400, "invalid_request");
   const entry = refreshTokens.get(body.refresh_token);
   const now = Date.now();
   if (!entry || now > entry.expiresAt) {
-    if (entry) {
-      refreshTokens.delete(body.refresh_token);
-      persist();
-    }
+    if (entry) transaction(() => { refreshTokens.delete(body.refresh_token!); });
     return err(401, "invalid_token");
   }
-  let successor = entry.rotatedTo ? refreshTokens.get(entry.rotatedTo) : undefined;
-  let refreshToken = entry.rotatedTo;
-  if (!successor || !refreshToken || now > successor.expiresAt) {
-    refreshToken = newToken();
-    successor = {
-      clientId: entry.clientId,
-      createdAt: now,
-      expiresAt: now + REFRESH_TOKEN_TTL_S * 1000,
+  if (entry.rotatedTo) {
+    // A retry of a rotation whose response may have been lost: the same result, nothing new minted.
+    const successor = refreshTokens.get(entry.rotatedTo);
+    if (!successor || !entry.rotationAccess || !findValidAccessToken(entry.rotationAccess) || (entry.replays ?? 0) >= MAX_GRACE_REPLAYS) {
+      return err(401, "invalid_token");
+    }
+    entry.replays = (entry.replays ?? 0) + 1;
+    return {
+      status: 200,
+      body: { access_token: entry.rotationAccess, refresh_token: entry.rotatedTo, token_type: "bearer", expires_in: Math.max(1, Math.floor((accessTokens.get(entry.rotationAccess)!.expiresAt - now) / 1000)) },
+    };
+  }
+  const rotate = body.accepts_rotation === true;
+  const accessToken = newToken();
+  const refreshToken = rotate ? newToken() : undefined;
+  let retired = false;
+  const committed = transaction(() => {
+    accessTokens.set(accessToken, {
+      clientId: entry.clientId, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000,
       ...(entry.family !== undefined ? { family: entry.family } : {}),
       ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
-    };
-    refreshTokens.set(refreshToken, successor);
-    // The used token lives only for the grace window (never longer than it already had).
-    entry.rotatedTo = refreshToken;
-    entry.expiresAt = Math.min(entry.expiresAt, now + ROTATION_GRACE_S * 1000);
-  }
-  const accessToken = newToken();
-  accessTokens.set(accessToken, {
-    clientId: entry.clientId,
-    createdAt: now,
-    expiresAt: now + ACCESS_TOKEN_TTL_S * 1000,
-    ...(entry.family !== undefined ? { family: entry.family } : {}),
-    ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
+    });
+    if (refreshToken) {
+      refreshTokens.set(refreshToken, {
+        clientId: entry.clientId, createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000,
+        ...(entry.family !== undefined ? { family: entry.family } : {}),
+        ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
+      });
+      // The used token lives only for the grace window (never longer than it already had).
+      entry.rotatedTo = refreshToken;
+      entry.rotationAccess = accessToken;
+      entry.expiresAt = Math.min(entry.expiresAt, now + ROTATION_GRACE_S * 1000);
+    } else {
+      entry.expiresAt = now + REFRESH_TOKEN_TTL_S * 1000;
+    }
+    retired = retireOlderLogins(entry.clientId, entry.family ?? 0);
   });
-  retireOlderLogins(entry.clientId, entry.family ?? 0);
-  persist();
+  if (!committed) return err(503, "server_error");
+  if (retired) announceRetired(entry.clientId, entry.family ?? 0);
   return {
     status: 200,
     body: {
       access_token: accessToken,
-      refresh_token: refreshToken,
+      ...(refreshToken ? { refresh_token: refreshToken } : {}),
       token_type: "bearer",
       expires_in: ACCESS_TOKEN_TTL_S,
     },
@@ -362,6 +452,15 @@ export interface BearerCheck {
   /** WS subprotocol to echo back in the 101 response (if any). */
   acceptProtocol?: string;
   clientId?: string;
+  /** The stable browser id this login was enrolled for; the relay binds a connection's id to it. */
+  browserId?: string;
+}
+
+/** The browser id inside a V8 clientId (`v8-<person>-<browserId>`), taken by the person the route recorded. */
+function browserIdOf(entry: TokenEntry): string | undefined {
+  const person = entry.enrollmentBinding?.person;
+  const prefix = person === undefined ? null : `v8-${person}-`;
+  return prefix && entry.clientId.startsWith(prefix) ? entry.clientId.slice(prefix.length) : undefined;
 }
 
 /**
@@ -397,8 +496,8 @@ export function checkWsBearer(opts: {
 
   const entry = findValidAccessToken(token);
   if (!entry) return { ok: false };
-  retireOlderLogins(entry.clientId, entry.family ?? 0);
-  return { ok: true, acceptProtocol, clientId: entry.clientId };
+  // Validation only: the login becomes the browser's login at admission (activateLogin), not here.
+  return { ok: true, acceptProtocol, clientId: entry.clientId, browserId: browserIdOf(entry) };
 }
 
 /** Whether an access bearer is currently valid (a connection's mid-session check is {@link isSessionLive}). */
