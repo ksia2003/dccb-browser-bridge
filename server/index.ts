@@ -23,13 +23,14 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { loopbackPeerUid, trustedLocalUids } from "./peer-uid.js";
 import type { Duplex } from "node:stream";
 import type { BridgeMessage, EnrollRedeemResponse, ToolRequest, ToolResponse } from "../shared/protocol.js";
-import { compareExtensionVersions, isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol.js";
+import { compareExtensionVersions, HEARTBEAT_INTERVAL_MS, isExtensionVersion, RELAY_SILENCE_TIMEOUT_MS, WS_CLOSE_UNAUTHORIZED } from "../shared/protocol.js";
 import {
   loadTokensFromDisk,
   startAuthSweep,
@@ -37,7 +38,9 @@ import {
   issueEnrollmentTokens,
   checkWsBearer,
   enrollmentBindingForAccessToken,
-  isAccessTokenValid,
+  isSessionLive,
+  sessionForAccessToken,
+  STATE_DIR,
   loadOrCreateHttpControlSecret,
   type AuthResult,
 } from "./auth.js";
@@ -111,8 +114,39 @@ const browsers = new Map<string, ConnectedBrowser>();
  * a dispatch can say so instead of "no extension connected". Cleared when that browser connects again.
  */
 const switchedOff = new Map<string, { name: string; at: string; address?: string }>();
+/**
+ * The switched-off record is also kept in the state folder, because the relay restarts on every DCCB
+ * update and a switched-off Chrome holds no connection to announce itself again. The extension's own
+ * setting stays the truth: its next connection (the person switching on) clears the record, and a record
+ * older than SWITCHED_OFF_KEEP_MS (a Chrome that was removed) is dropped.
+ */
+const SWITCHED_OFF_FILE = join(STATE_DIR, "switched-off.json");
+const SWITCHED_OFF_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+function loadSwitchedOff(): void {
+  try {
+    const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as Record<string, { name?: unknown; at?: unknown; address?: unknown }>;
+    for (const [id, v] of Object.entries(data)) {
+      if (typeof v?.name !== "string" || typeof v.at !== "string" || !(Date.now() - Date.parse(v.at) < SWITCHED_OFF_KEEP_MS)) continue;
+      switchedOff.set(id, { name: v.name, at: v.at, ...(typeof v.address === "string" ? { address: v.address } : {}) });
+    }
+  } catch { /* no record yet, or an unreadable one: start empty */ }
+  // The most recent switch-off stands in for "the last Chrome to leave" the relay lost track of in the restart.
+  const latest = [...switchedOff].sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at))[0];
+  if (latest) lastGoneSwitchedOff = latest[0];
+}
+function saveSwitchedOff(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    const temporary = `${SWITCHED_OFF_FILE}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(Object.fromEntries(switchedOff)), { mode: 0o600 });
+    renameSync(temporary, SWITCHED_OFF_FILE);
+  } catch (e) { log("could not save the switched-off record:", (e as Error).message); }
+}
+/** Test hook: how long a socket may stay silent before the relay closes it. */
+const SILENCE_TIMEOUT_MS = Number(process.env.BB_HEARTBEAT_TIMEOUT_MS) || RELAY_SILENCE_TIMEOUT_MS;
 /** The browser whose socket closed last, if the person switched it off; any other last departure clears it. */
 let lastGoneSwitchedOff: string | null = null;
+loadSwitchedOff();
 /** The first Browser Bridge from the Chrome Web Store; older copies were unpacked from a ZIP. */
 const STORE_EXTENSION_VERSION = "6.0.0";
 let cachedReleaseVersion: { path: string; size: number; mtimeMs: number; version: string | null } | undefined;
@@ -380,7 +414,7 @@ function handleConnection(
     ...(from && from !== "127.0.0.1" && from !== "::1" ? { address: from } : {}),
   };
   browsers.set(id, entry);
-  switchedOff.delete(id);
+  if (switchedOff.delete(id)) saveSwitchedOff();
   lastGoneSwitchedOff = null;
   log(`extension connected: ${id} (${name}); ${browsers.size} now connected`);
   const route = routeFromEnvironment();
@@ -393,20 +427,35 @@ function handleConnection(
     tab_group: browserBridgeTabGroupEnabled(),
   });
 
-  // If this connection was bearer-authed (not trusted-local), poll the token's
-  // validity and close 4401 once it expires so the client refreshes+reconnects.
+  // If this connection was bearer-authed (not trusted-local), close 4401 once its LOGIN ends (refresh
+  // token expired or superseded by a re-enrollment). The 2 h access token that opened the socket does
+  // not bound it: the extension refreshes it over HTTP and keeps this socket, so work in progress
+  // survives (6.0.2; 4401 at every access-token expiry used to end the AI's running work).
   const bearer = extractBearer(req, subprotocols);
+  const session = bearer ? sessionForAccessToken(bearer) : null;
   let tokenWatch: ReturnType<typeof setInterval> | null = null;
   if (bearer) {
     tokenWatch = setInterval(() => {
-      if (!isAccessTokenValid(bearer)) {
-        log("bearer expired mid-session; closing 4401");
-        ws.close(WS_CLOSE_UNAUTHORIZED, "token_expired");
+      if (!session || !isSessionLive(session)) {
+        log("login ended mid-session; closing 4401");
+        ws.close(WS_CLOSE_UNAUTHORIZED, "login_ended");
       }
     }, 30_000);
   }
 
+  // Heartbeat: any frame from the extension counts; the extension pings every HEARTBEAT_INTERVAL_MS.
+  // A socket that went silent (PC asleep, network gone without a FIN) never closes by itself, and its
+  // pipes would stay "open" for an engine that talks to nobody.
+  let lastFrameAt = Date.now();
+  const silenceWatch = setInterval(() => {
+    if (Date.now() - lastFrameAt > SILENCE_TIMEOUT_MS) {
+      log(`extension ${id} silent for over ${Math.round(SILENCE_TIMEOUT_MS / 1000)} s; closing the dead socket`);
+      ws.terminate();
+    }
+  }, Math.min(HEARTBEAT_INTERVAL_MS, Math.max(250, SILENCE_TIMEOUT_MS / 4)));
+
   ws.on("message", (data) => {
+    lastFrameAt = Date.now();
     let msg: BridgeMessage;
     try {
       msg = JSON.parse(data.toString()) as BridgeMessage;
@@ -435,7 +484,17 @@ function handleConnection(
         if (current?.ws === ws) {
           current.switchedOffAt = new Date().toISOString();
           switchedOff.set(id, { name: current.name, at: current.switchedOffAt, ...(current.address ? { address: current.address } : {}) });
+          saveSwitchedOff();
           log(`extension switched off by the person: ${id} (${current.name})`);
+        }
+        break;
+      }
+      case "extension_rename": {
+        const current = browsers.get(id);
+        const renamed = typeof msg.name === "string" ? msg.name.trim().slice(0, 40) : "";
+        if (current?.ws === ws && renamed) {
+          current.name = renamed;
+          log(`extension ${id} renamed to ${renamed}`);
         }
         break;
       }
@@ -457,6 +516,7 @@ function handleConnection(
 
   ws.on("close", () => {
     if (tokenWatch) clearInterval(tokenWatch);
+    clearInterval(silenceWatch);
     pipe.onBrowserClosed(ws);
     for (const [requestId, waiter] of pending) {
       if (waiter.ws !== ws) continue;

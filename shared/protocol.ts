@@ -54,6 +54,28 @@ export interface ExtensionSwitchedOff {
   type: "extension_switched_off";
 }
 
+/**
+ * Extension → relay: the person renamed this Chrome in the popup. The relay applies the name to the
+ * live connection, so a rename no longer needs a reconnect (which ended the AI's running work). A relay
+ * that does not know the frame ignores it; the new name then reaches it at the next natural reconnect
+ * through the `name` query of the socket URL.
+ */
+export interface ExtensionRename {
+  type: "extension_rename";
+  name: string;
+}
+
+/**
+ * Heartbeat (both directions ride the same frames). The extension sends `ping` every
+ * {@link HEARTBEAT_INTERVAL_MS} and the relay answers `pong`. The relay closes a socket that has sent
+ * no frame for {@link RELAY_SILENCE_TIMEOUT_MS}; the extension closes and reopens a socket that has
+ * received no frame for {@link EXTENSION_SILENCE_TIMEOUT_MS}. Both exceed two missed beats, so one
+ * late frame never drops a live connection.
+ */
+export const HEARTBEAT_INTERVAL_MS = 20_000;
+export const RELAY_SILENCE_TIMEOUT_MS = 60_000;
+export const EXTENSION_SILENCE_TIMEOUT_MS = 50_000;
+
 /** Relay → extension: current version of the ZIP this HOME distributes. */
 export interface LatestExtensionVersion {
   type: "latest_extension_version";
@@ -125,7 +147,7 @@ export interface PipeEvent {
 export const PIPE_MIN_EXTENSION_VERSION = "1.1.0";
 
 /** Any message that can cross the wire in either direction. */
-export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | ExtensionSwitchedOff | LatestExtensionVersion
+export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | ExtensionSwitchedOff | ExtensionRename | LatestExtensionVersion
   | PipeOpen | PipeClose | PipeCommand | PipeResponse | PipeEvent;
 
 /** Chrome's manifest version for this release line is three numeric components. */
@@ -166,7 +188,7 @@ export interface EnrollRedeemResponse {
 /** Success body for `POST /api/auth/token` and `/api/auth/refresh`. */
 export interface TokenResponse {
   access_token: string;
-  /** Absent on refresh (refresh token is long-lived and reused). */
+  /** Present on enrollment and (6.0.2) on every refresh: the refresh token rotates. Absent from older relays' refresh. */
   refresh_token?: string;
   token_type: "bearer";
   /** Access-token lifetime, seconds. */
