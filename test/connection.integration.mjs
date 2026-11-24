@@ -189,7 +189,7 @@ try {
 
   // The notice-only connection: authenticated, not a browser, acknowledged, durable, and stale after a switch-on.
   const sendNotice = (token, id) => new Promise((resolve, reject) => {
-    const notice = new WebSocket(`ws://127.0.0.1:${wsPort}/ws?id=${id}&name=NoticeName&notice=1`, [`bb-bearer.${token}`], { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
+    const notice = new WebSocket(`ws://127.0.0.1:${wsPort}/notice?id=${id}&name=NoticeName`, [`bb-bearer.${token}`], { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
     notice.once("error", reject);
     notice.once("open", () => notice.send(JSON.stringify({ type: "extension_switched_off" })));
     notice.on("message", data => { resolve(JSON.parse(String(data))); });

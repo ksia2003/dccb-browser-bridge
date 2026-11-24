@@ -294,7 +294,9 @@ wsHttp.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (url.pathname !== "/ws") {
+  // `/notice` is the notice-only path. It is a separate path (not a flag on /ws) so a relay or door that
+  // predates it refuses the upgrade instead of registering the connection as a browser that gets work.
+  if (url.pathname !== "/ws" && url.pathname !== "/notice") {
     socket.destroy();
     return;
   }
@@ -370,7 +372,7 @@ wsHttp.on("upgrade", (req, socket, head) => {
   // `handleProtocols` (set on the WebSocketServer) already echoes the
   // `bb-bearer.*` subprotocol back into the 101, so no per-upgrade options are
   // needed here. handleUpgrade's signature is (request, socket, head, cb).
-  const notice = url.searchParams.get("notice") === "1";
+  const notice = url.pathname === "/notice";
   wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
     if (notice) { handleNotice(ws, req, { id: selfId, name: selfName }); return; }
     handleConnection(ws, req, subprotocols, {
@@ -411,7 +413,7 @@ function isTrustedSource(socket: Duplex): boolean {
 }
 
 /**
- * The notice-only connection (`/ws?notice=1`): an authenticated way for a switched-off Chrome (which
+ * The notice-only connection (`/notice`): an authenticated way for a switched-off Chrome (which
  * holds no bridge socket) to tell the relay the person switched it off. It is NOT a browser: it is
  * never registered, never dispatched to, activates no login and replaces no socket. It takes one
  * `extension_switched_off`, records it durably, answers `switched_off_ack`, and closes. A notice is

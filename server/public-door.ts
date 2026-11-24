@@ -304,7 +304,7 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
       socket.destroy();
       return;
     }
-    if (url.pathname !== "/ws") { socket.destroy(); return; }
+    if (url.pathname !== "/ws" && url.pathname !== "/notice") { socket.destroy(); return; }
     const origin = req.headers.origin;
     if (origin !== undefined && !isChromeExtensionOrigin(origin)) {
       console.warn("[public door] WS rejected: Origin is not a Chrome extension");
@@ -361,8 +361,13 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   if (browserName) homeUrl.searchParams.set("name", browserName);
   // The notice-only connection (a switched-off Chrome telling HOME so) is relayed as such: it takes no
   // admission and activates no login.
-  const notice = incomingUrl.searchParams.get("notice") === "1";
-  if (notice) homeUrl.searchParams.set("notice", "1");
+  // Only the dedicated /notice path is the notice connection; HOME gets /notice too, so a HOME that
+  // predates it refuses (no browser registered). On that path only the notice and its ack cross.
+  const notice = incomingUrl.pathname === "/notice";
+  if (notice) homeUrl.pathname = homeUrl.pathname.replace(/\/ws$/, "/notice");
+  const noticeFrame = (data: RawData, type: string): boolean => {
+    try { return (JSON.parse(data.toString()) as { type?: unknown }).type === type; } catch { return false; }
+  };
   const home = new WebSocket(homeUrl, { maxPayload: 0 });
   let closed = false;
   let admitted = notice;
@@ -397,10 +402,12 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   };
   browser.on("message", (data, isBinary) => {
     if (!session || !isSessionLive(session)) { close(WS_CLOSE_UNAUTHORIZED, "login_ended"); return; }
+    if (notice && !noticeFrame(data, "extension_switched_off")) return;
     if (homeOpen && admitted) forward(home, data, isBinary);
     else if (queued.length < 20) queued.push({ data, isBinary });
   });
   home.on("message", (data, isBinary) => {
+    if (notice && !noticeFrame(data, "switched_off_ack")) return;
     if (!admitted) {
       // Admission is HOME's own `relay_binding` for this route, not merely an upstream 101. Only then
       // does the new login retire its predecessors (durably), and only then does anything flow.

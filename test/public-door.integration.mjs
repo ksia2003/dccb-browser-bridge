@@ -35,8 +35,20 @@ const homeWss = new WebSocketServer({ noServer: true });
 const homeUpgradeOrigins = [];
 const homeUpgradeUrls = [];
 let homeSendsBinding = true;
+const homeNoticeFrames = [];
 homeHttp.on("upgrade", (req, socket, head) => {
-  if (new URL(req.url, "http://localhost").pathname !== "/ws") { socket.destroy(); return; }
+  const path = new URL(req.url, "http://localhost").pathname;
+  if (path === "/notice") {
+    // The notice path: HOME records only notice frames and answers with the ack.
+    homeUpgradeUrls.push(req.url);
+    homeWss.handleUpgrade(req, socket, head, ws => ws.on("message", data => {
+      homeNoticeFrames.push(JSON.parse(data.toString()).type);
+      ws.send(JSON.stringify({ type: "relay_binding", relay_binding: "home:bob:home-box" })); // not an ack: must not cross
+      ws.send(JSON.stringify({ type: "switched_off_ack", applied: true }));
+    }));
+    return;
+  }
+  if (path !== "/ws") { socket.destroy(); return; }
   homeUpgradeOrigins.push(req.headers.origin);
   homeUpgradeUrls.push(req.url);
   homeWss.handleUpgrade(req, socket, head, ws => {
@@ -224,13 +236,18 @@ try {
   console.log("  PASS  the door admits a new login on HOME's relay_binding only; refreshing retires nothing");
 
   // The notice-only connection is relayed as such, and a frame sent before HOME is ready is not lost.
-  const noticeThroughDoor = new WebSocket(`ws://127.0.0.1:${publicPort}/ws?notice=1`, [`bb-bearer.${(await (await refreshWith(profile3.refresh_token)).json()).access_token}`]);
-  noticeThroughDoor.once("open", () => noticeThroughDoor.send(JSON.stringify({ type: "extension_switched_off" })));
-  const echoes = await new Promise(resolve => { const seen = []; noticeThroughDoor.on("message", data => { seen.push(data.toString()); if (seen.length === 2) resolve(seen); }); });
-  assert.ok(echoes.includes(JSON.stringify({ type: "extension_switched_off" })), "the early frame reached HOME (the mock echoes it)");
-  assert.match(homeUpgradeUrls.at(-1), /[?&]notice=1(&|$)/);
+  const noticeThroughDoor = new WebSocket(`ws://127.0.0.1:${publicPort}/notice`, [`bb-bearer.${(await (await refreshWith(profile3.refresh_token)).json()).access_token}`]);
+  noticeThroughDoor.once("open", () => {
+    noticeThroughDoor.send(JSON.stringify({ type: "tool_response", id: "x", result: {} })); // not a notice: must not cross
+    noticeThroughDoor.send(JSON.stringify({ type: "extension_switched_off" }));
+  });
+  const received = await new Promise(resolve => { const seen = []; noticeThroughDoor.on("message", data => { seen.push(JSON.parse(data.toString()).type); resolve(seen); }); });
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.deepEqual(homeNoticeFrames, ["extension_switched_off"], "the early frame reached HOME (buffered), and only the notice crossed");
+  assert.deepEqual(received, ["switched_off_ack"], "only the ack came back");
+  assert.equal(new URL(homeUpgradeUrls.at(-1), "http://x").pathname, "/notice", "HOME was asked for /notice, not /ws");
   noticeThroughDoor.close();
-  console.log("  PASS  the door relays the notice-only connection and buffers frames sent before HOME is ready");
+  console.log("  PASS  the door relays the dedicated /notice path, only notice and ack frames cross, early frames are buffered");
 
   // Another account on the box reaches the issuer over loopback too; it must not get this person's code.
   const foreign = startPublicDoor({

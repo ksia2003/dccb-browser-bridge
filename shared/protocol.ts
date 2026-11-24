@@ -55,7 +55,7 @@ export interface ExtensionSwitchedOff {
 }
 
 /**
- * Relay → extension, on the notice-only connection (`/ws?notice=1`): the switched-off notice was
+ * Relay → extension, on the notice-only connection (`/notice`): the switched-off notice was
  * handled. `applied` is false when the relay saw the Chrome connected again meanwhile (a stale notice).
  * Either way the extension may stop sending it.
  */
@@ -107,7 +107,7 @@ export interface RelayBinding {
   latest_extension_version?: string | null;
   /** HOME's optional Browser Bridge tab-group setting; absent means ungrouped. */
   tab_group?: boolean;
-  /** This relay understands the notice-only connection (`/ws?notice=1`); older relays would register it as a browser. */
+  /** This relay understands the notice-only connection (`/notice`); an older relay or door refuses the path (it is not `/ws`), so the connection is never registered as a browser. */
   switched_off_notice?: boolean;
 }
 
