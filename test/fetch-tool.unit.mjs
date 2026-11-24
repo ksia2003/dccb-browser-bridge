@@ -28,7 +28,8 @@ try {
   assert.equal(response.error, undefined);
   assert.equal(response.result.byteLength, responseBytes);
   assert.equal(Buffer.from(response.result.bodyBase64, "base64").length, responseBytes);
-  assert.equal(requestInit.signal, undefined);
+  // The signal exists only so switching Browser Bridge off can end a stalled fetch; nothing aborts it on a timer.
+  assert.ok(requestInit.signal instanceof AbortSignal && !requestInit.signal.aborted);
   console.log("  PASS  fetch returns an 8,000,001-byte body without adding a timeout or response cap");
 } finally {
   globalThis.fetch = previousFetch;

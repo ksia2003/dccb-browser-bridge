@@ -16,7 +16,8 @@ import { HEARTBEAT_INTERVAL_MS, isExtensionVersion, WS_CLOSE_UNAUTHORIZED } from
 import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
+import { abortAllFetches } from "./lib/tools/fetch";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, pendingAdoptions, setShuttingDown, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import type { ConnectionIssue } from "./lib/v8-auth";
 import { badgeFor, updateAvailable } from "./lib/badge";
@@ -43,9 +44,7 @@ let backoff = BACKOFF_MIN_MS;
  *  established connection. */
 let socketOpened = false;
 let latestExtensionVersion: string | null = null;
-/** When the relay last sent anything on the current socket; a socket silent for too long is dead. */
-let lastInboundAt = 0;
-let heartbeat: HeartbeatState = { lastInboundAt: 0, lastTickAt: 0, probeSince: null };
+let heartbeat: HeartbeatState = { lastInboundMono: 0, lastTickWall: 0, lastTickMono: 0, probeSince: null };
 /** True once the relay's `relay_binding` was accepted on the current socket; no work is taken before. */
 let bound = false;
 /** The device name the current socket's URL carried; a different current name is sent after binding. */
@@ -55,6 +54,8 @@ let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 const HANDSHAKE_DEADLINE_MS = 15_000;
 /** The off-notice the relay has not received yet (the person switched off while no socket was bound). */
 const OFF_NOTICE_KEY = "v8BrowserBridgeOffNoticePending";
+/** Set once a relay said (in `relay_binding`) that it understands the notice-only connection. */
+const NOTICE_SUPPORTED_KEY = "v8BrowserBridgeRelayNotice";
 /** Work in flight that may create tabs (pipe open/command, tool calls); switching off waits for it before it counts tabs. */
 const inflightWork = new Set<Promise<unknown>>();
 function tracked<T>(work: Promise<T>): Promise<T> {
@@ -167,6 +168,8 @@ function openSocket(): void {
   const openedSocket = socket;
   bound = false;
   socketName = auth.snapshot().deviceName;
+  // What this socket's relay_binding is checked against: the login as it is NOW, not as it may be when the frame arrives.
+  const expectation = auth.connectionExpectation();
   // Upgrade deadline: a handshake that neither opens nor fails (a black-holed route) is dropped and retried.
   clearHandshakeTimer();
   handshakeTimer = setTimeout(() => { if (socket === openedSocket) dropSocket("unreachable", "no upgrade"); }, HANDSHAKE_DEADLINE_MS);
@@ -174,8 +177,7 @@ function openSocket(): void {
     if (socket !== openedSocket) return;
     log("connected");
     socketOpened = true;
-    lastInboundAt = Date.now();
-    heartbeat = { lastInboundAt, lastTickAt: lastInboundAt, probeSince: null };
+    heartbeat = { lastInboundMono: performance.now(), lastTickWall: Date.now(), lastTickMono: performance.now(), probeSince: null };
     // Binding deadline: the relay must identify itself (`relay_binding`) soon after the socket opens.
     clearHandshakeTimer();
     handshakeTimer = setTimeout(() => { if (socket === openedSocket && !bound) dropSocket("silent", "no relay_binding"); }, HANDSHAKE_DEADLINE_MS);
@@ -190,8 +192,7 @@ function openSocket(): void {
   socket.addEventListener("message", (event) => {
     // A socket this worker already gave up on (replaced, dropped as dead) must not reach its successor.
     if (socket !== openedSocket) return;
-    lastInboundAt = Date.now();
-    heartbeat.lastInboundAt = lastInboundAt;
+    heartbeat.lastInboundMono = performance.now();
     let msg: BridgeMessage;
     try {
       msg = JSON.parse(String(event.data)) as BridgeMessage;
@@ -199,7 +200,7 @@ function openSocket(): void {
       log("dropping non-JSON frame");
       return;
     }
-    handleMessage(msg, openedSocket);
+    handleMessage(msg, openedSocket, expectation);
   });
 
   socket.addEventListener("close", (event) => {
@@ -264,11 +265,13 @@ function scheduleReconnect(issue: ConnectionIssue = "unreachable"): void {
 
 // --- Message handling -------------------------------------------------------
 
-function handleMessage(msg: BridgeMessage, from: WebSocket): void {
+function handleMessage(msg: BridgeMessage, from: WebSocket, expectation: auth.ConnectionExpectation | null): void {
   switch (msg.type) {
     case "relay_binding":
       setAiTabGroupingEnabled(msg.tab_group === true);
-      void auth.onRelayBinding(msg.relay_binding).then(accepted => {
+      if (msg.switched_off_notice === true) void chrome.storage.local.set({ [NOTICE_SUPPORTED_KEY]: true });
+      if (!expectation) break;
+      void auth.onRelayBinding(msg.relay_binding, expectation, () => socket === from).then(accepted => {
         // The answer is for the socket that asked; if it was replaced meanwhile, it is dropped.
         if (!accepted || socket !== from) return;
         bound = true;
@@ -327,9 +330,10 @@ function sendOn(target: WebSocket | null, msg: BridgeMessage): void {
  */
 function startKeepalive(): void {
   stopKeepalive();
-  heartbeat.lastTickAt = Date.now();
+  heartbeat.lastTickWall = Date.now();
+  heartbeat.lastTickMono = performance.now();
   keepalive = setInterval(() => {
-    const tick = heartbeatTick(heartbeat, Date.now());
+    const tick = heartbeatTick(heartbeat, Date.now(), performance.now());
     heartbeat = tick.state;
     if (tick.action === "drop") { dropSocket("silent", "no frame from the relay"); return; }
     send({ type: "ping" });
@@ -417,16 +421,26 @@ function pushSnapshot(): void {
  * Tabs counted before the work stopped would miss one the in-flight work was still opening.
  */
 async function stopWorkAndCloseAiTabs(stop: () => Promise<void>): Promise<void> {
-  await stop();
-  await setExecutionEnabled(false);
-  await Promise.allSettled([...inflightWork]);
-  for (let pass = 0; pass < 2; pass++) {
-    const tabIds = (await listAiTabs()).flatMap(entry => entry.tab.id === undefined ? [] : [entry.tab.id]);
-    if (!tabIds.length) break;
-    await removeAiTabs(tabIds).catch(error => log("closing AI tabs failed", String(error)));
+  setShuttingDown(true); // a child tab adopted from now on is closed, not kept
+  try {
+    await stop();
+    abortAllFetches(); // a stalled response body must not hold the shutdown
+    await setExecutionEnabled(false);
+    // Work already past the checks, and child tabs being adopted, get a bounded time to settle; the
+    // sweeps below do not depend on them finishing.
+    const settled = Promise.allSettled([...inflightWork, ...pendingAdoptions()]);
+    await Promise.race([settled, new Promise(resolve => setTimeout(resolve, SHUTDOWN_DRAIN_MS))]);
+    for (let pass = 0; pass < 2; pass++) {
+      const tabIds = (await listAiTabs()).flatMap(entry => entry.tab.id === undefined ? [] : [entry.tab.id]);
+      if (!tabIds.length) break;
+      await removeAiTabs(tabIds).catch(error => log("closing AI tabs failed", String(error)));
+    }
+  } finally {
+    setShuttingDown(false);
   }
   pushSnapshot();
 }
+const SHUTDOWN_DRAIN_MS = 5_000;
 
 /**
  * The popup's on/off switch. Off: tell the relay it was the person (a PC that merely went offline looks
@@ -441,46 +455,49 @@ async function setEnabledByPerson(on: boolean): Promise<void> {
     await auth.setEnabled(true);
     return;
   }
+  // The notice is stored first and cleared only when the relay answers that it has it (deliverOffNotice).
   await chrome.storage.local.set({ [OFF_NOTICE_KEY]: true });
-  if (bound && socket && socket.readyState === WebSocket.OPEN) {
-    send({ type: "extension_switched_off" });
-    await chrome.storage.local.remove(OFF_NOTICE_KEY);
-  }
   await stopWorkAndCloseAiTabs(() => auth.setEnabled(false)); // closes the socket and sets state "off"
   void deliverOffNotice();
 }
 
 /**
- * Tell the relay the person switched off, over a short connection that does nothing else: the worker
- * ignores every frame on it (it is not the bridge's socket and takes no tool or pipe work), sends the
- * notice and closes. Retried by the alarm until it is delivered, or dropped when the person switched on again.
+ * Tell the relay the person switched off, over the notice-only connection (`/ws?notice=1`). It is not the
+ * bridge socket: the relay does not register it as a browser, never sends it work, activates no login and
+ * replaces no socket; the worker adds no handler for tool or pipe frames on it. The relay records the
+ * notice durably and answers `switched_off_ack`; only that answer clears the stored notice. A relay that
+ * never said it understands the notice (an older one would treat the connection as a browser) is not
+ * tried. The alarm retries until acknowledged or until the person switches on again.
  */
 let noticeInFlight = false;
 async function deliverOffNotice(): Promise<void> {
   if (noticeInFlight) return;
-  if ((await chrome.storage.local.get(OFF_NOTICE_KEY))[OFF_NOTICE_KEY] !== true) return;
-  if (auth.snapshot().enabled || !auth.hasProfile()) { await chrome.storage.local.remove(OFF_NOTICE_KEY); return; }
+  const stored = await chrome.storage.local.get([OFF_NOTICE_KEY, NOTICE_SUPPORTED_KEY]);
+  if (stored[OFF_NOTICE_KEY] !== true) return;
+  if (auth.snapshot().enabled || !auth.hasProfile() || stored[NOTICE_SUPPORTED_KEY] !== true) { await chrome.storage.local.remove(OFF_NOTICE_KEY); return; }
   noticeInFlight = true;
   try {
     if (auth.accessTokenStale() && (!(await auth.refreshAccessToken()) || auth.accessTokenStale())) return;
-    const url = auth.wsUrl();
+    const base = auth.wsUrl();
     const subprotocol = auth.bearerSubprotocol();
-    if (!url || (auth.requiresBearer() && !subprotocol)) return;
-    const delivered = await new Promise<boolean>(resolve => {
+    if (!base || (auth.requiresBearer() && !subprotocol)) return;
+    const url = new URL(base);
+    url.searchParams.set("notice", "1");
+    const acknowledged = await new Promise<boolean>(resolve => {
       let notice: WebSocket;
-      try { notice = auth.requiresBearer() ? new WebSocket(url, [subprotocol as string]) : new WebSocket(url); }
+      try { notice = auth.requiresBearer() ? new WebSocket(url.toString(), [subprotocol as string]) : new WebSocket(url.toString()); }
       catch { resolve(false); return; }
       const give = (ok: boolean): void => { clearTimeout(timer); try { notice.close(); } catch { /* closing */ } resolve(ok); };
       const timer = setTimeout(() => give(false), 10_000);
-      notice.addEventListener("open", () => {
-        notice.send(JSON.stringify({ type: "extension_switched_off" } satisfies BridgeMessage));
-        // Closing after the send flushes it (a close handshake follows queued data).
-        setTimeout(() => give(true), 300);
+      notice.addEventListener("open", () => notice.send(JSON.stringify({ type: "extension_switched_off" } satisfies BridgeMessage)));
+      notice.addEventListener("message", event => {
+        try { if ((JSON.parse(String(event.data)) as BridgeMessage).type === "switched_off_ack") give(true); } catch { /* not a frame */ }
       });
       notice.addEventListener("error", () => give(false));
       notice.addEventListener("close", () => give(false));
     });
-    if (delivered && !auth.snapshot().enabled) await chrome.storage.local.remove(OFF_NOTICE_KEY);
+    // A switch-on during the exchange wins: the person's setting is the truth, whatever the relay recorded.
+    if (acknowledged && !auth.snapshot().enabled) await chrome.storage.local.remove(OFF_NOTICE_KEY);
   } finally {
     noticeInFlight = false;
   }

@@ -170,6 +170,7 @@ export async function openPipe(channel: string, workspaceValue: string): Promise
     // No tab to give back: open one, unless the person closed the last one (the engine then hears
     // why when it tries to open a page).
     if (tabs.length === 0 && !(await stoppedByPerson(workspace))) tabs = [await createControlledTab("about:blank", workspace)];
+    if (channels.get(channel) !== entry) return; // closed while tabs were being listed or opened: retired
     for (const tab of tabs) {
       entry.known.add(tab.id!);
       event(channel, "chrome.tabs.onCreated", [tabForWire(tab)]);
@@ -348,5 +349,8 @@ export async function handlePipeCommand(frame: PipeCommand): Promise<void> {
   } catch (error) {
     response.error = error instanceof Error ? error.message : String(error);
   }
+  // A channel belongs to the socket it was opened on. If it was closed meanwhile (socket gone, engine
+  // left) this answer is retired work: it must not be written to whatever socket exists now.
+  if (channels.get(frame.channel) !== entry) return;
   send(response);
 }

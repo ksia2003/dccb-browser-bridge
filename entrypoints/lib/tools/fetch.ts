@@ -71,8 +71,10 @@ async function fetchFromChrome(args: ToolArgs): Promise<unknown> {
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
     ? Math.max(1, Math.floor(args.timeoutMs))
     : null;
-  const controller = timeoutMs === null ? null : new AbortController();
-  const timeout = controller && timeoutMs !== null
+  // Every fetch can be aborted by switching Browser Bridge off (abortAllFetches), even without a timeout.
+  const controller = new AbortController();
+  activeFetches.add(controller);
+  const timeout = timeoutMs !== null
     ? setTimeout(() => controller.abort(), timeoutMs)
     : null;
 
@@ -83,7 +85,7 @@ async function fetchFromChrome(args: ToolArgs): Promise<unknown> {
       credentials: "include",
       redirect: "follow",
     };
-    if (controller) init.signal = controller.signal;
+    init.signal = controller.signal;
     if (hasTextBody) init.body = args.body as string;
     if (hasBinaryBody) {
       // A copied buffer has the concrete ArrayBuffer type required by BlobPart
@@ -106,7 +108,8 @@ async function fetchFromChrome(args: ToolArgs): Promise<unknown> {
       bodyBase64: encodeBase64(body),
     };
   } catch (error) {
-    if (controller?.signal.aborted) throw new Error(`fetch: timed out after ${timeoutMs}ms`);
+    if (switchedOffAbort.has(controller)) throw new Error("fetch: Browser Bridge was switched off");
+    if (controller.signal.aborted) throw new Error(`fetch: timed out after ${timeoutMs}ms`);
     // With its site access limited (Chrome's "on click" / specific sites) the extension cannot read
     // other sites; only the person can open it again.
     const limited = await Promise.resolve().then(() => chrome.permissions.contains({ origins: ["<all_urls>"] })).then(ok => !ok, () => false);
@@ -115,8 +118,17 @@ async function fetchFromChrome(args: ToolArgs): Promise<unknown> {
     }
     throw new Error(`fetch: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
+    activeFetches.delete(controller);
+    switchedOffAbort.delete(controller);
     if (timeout) clearTimeout(timeout);
   }
 }
 
 register("fetch", fetchFromChrome);
+
+const activeFetches = new Set<AbortController>();
+const switchedOffAbort = new Set<AbortController>();
+/** Switching off ends running fetches (a stalled response body must not hold the shutdown). */
+export function abortAllFetches(): void {
+  for (const controller of activeFetches) { switchedOffAbort.add(controller); controller.abort(); }
+}

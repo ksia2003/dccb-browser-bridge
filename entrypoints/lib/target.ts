@@ -410,9 +410,11 @@ export function installNewTabAdopter(): void {
     }
   });
   chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
-    void handleCreatedNavigationTarget(details).catch((error) => {
+    const work = handleCreatedNavigationTarget(details).catch((error) => {
       log("controlled-target navigation handling failed:", error instanceof Error ? error.message : String(error));
     });
+    adoptions.add(work);
+    void work.finally(() => adoptions.delete(work));
   });
 }
 
@@ -436,6 +438,16 @@ async function seedBrowserSelection(): Promise<void> {
   }
 }
 
+/** Child tabs being adopted right now; switching off waits for them (and closes them, see `shuttingDown`). */
+const adoptions = new Set<Promise<unknown>>();
+export function pendingAdoptions(): Promise<unknown>[] { return [...adoptions]; }
+/**
+ * True while Browser Bridge is being switched off: a child of an AI tab whose adoption finishes now is
+ * closed instead of kept, because switching off closes every AI tab and the sweeps may already be done.
+ */
+let shuttingDown = false;
+export function setShuttingDown(value: boolean): void { shuttingDown = value; }
+
 async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNavigationSourceCallbackDetails): Promise<void> {
   const tabId = details.tabId;
   if (handledNavigationTargets.has(tabId)) return;
@@ -451,6 +463,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       return;
     }
 
+    if (shuttingDown) { await removeAiTabs([tabId]).catch(() => undefined); return; }
     const [child, source] = await Promise.all([
       chrome.tabs.get(tabId).catch(() => undefined),
       chrome.tabs.get(details.sourceTabId).catch(() => undefined),
@@ -483,6 +496,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       await chrome.tabs.move(tabId, { windowId: source.windowId, index: -1 });
     }
     await setOwner(tabId, workspace);
+    if (shuttingDown) { await removeAiTabs([tabId]).catch(() => undefined); return; }
     if (aiTabGroupingEnabled) await addToAiTabGroup(tabId);
     await muteAiTab(tabId);
     await restoreChildSelection(tabId, details.sourceTabId, source.windowId, restoreCandidate, activationMark);

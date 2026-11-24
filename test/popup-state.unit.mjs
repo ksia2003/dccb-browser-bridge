@@ -40,10 +40,12 @@ check("first connection: plain 'connecting', no rows", d.title === "연결하는
 d = describeConnecting({ lastConnectedAt: null, nextRetryAt: now + 8_000, retryReason: "unreachable", now });
 check("first connection failing: says never connected, why, and when", /연결하지 못했습니다/.test(d.title)
   && d.rows[0].value === "아직 없음" && d.rows[1].value === "서버에 닿지 않음" && d.rows[2].value === "8초 뒤", JSON.stringify(d));
-d = describeConnecting({ lastConnectedAt: now - 2 * 60_000, nextRetryAt: now + 4_000, retryReason: "dropped", now });
+d = describeConnecting({ lastConnectedAt: now - 2 * 60_000, outageStartedAt: now - 2 * 60_000, nextRetryAt: now + 4_000, retryReason: "dropped", now });
 check("short gap: 'reconnecting' with the last time and reason", d.title === "다시 연결하는 중" && d.rows[0].value === "2분 전" && d.rows[1].value === "연결이 끊어짐", JSON.stringify(d));
-d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, nextRetryAt: now + 30_000, retryReason: "unreachable", now });
+d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, outageStartedAt: now - 3 * 24 * 3600_000, nextRetryAt: now + 30_000, retryReason: "unreachable", now });
 check("long unreachable: 3 days ago, not reachable", d.title === "서버에 연결되지 않음" && d.rows[0].label === "마지막 연결" && d.rows[0].value === "3일 전" && d.rows[2].value === "30초 뒤", JSON.stringify(d));
+d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, outageStartedAt: null, nextRetryAt: null, retryReason: null, now });
+check("switched on after 3 days of deliberate downtime, no failure seen: just 'connecting', not a long outage", d.title === "연결하는 중" && d.rows[0].value === "3일 전", JSON.stringify(d));
 check("rows are labelled, never a dotted chain", ![d.title, d.desc, ...d.rows.map(r => r.value)].some(t => t.includes("·")));
 check("time wording", formatAgo(10_000) === "방금" && formatAgo(61_000 * 5) === "5분 전" && formatAgo(3 * 3600_000) === "3시간 전" && formatIn(0) === "지금 시도하는 중" && formatIn(90_000) === "2분 뒤");
 
@@ -53,19 +55,22 @@ check("a connection that held for 3 days and dropped 30 s ago is a short gap, no
 d = describeConnecting({ lastConnectedAt: now - 3 * 24 * 3600_000, outageStartedAt: now - 20 * 60_000, nextRetryAt: now + 5_000, retryReason: "unreachable", now });
 check("20 minutes into the outage it is a long one, and the row says 20 minutes", d.title === "서버에 연결되지 않음" && d.rows[0].value === "20분 전", JSON.stringify(d));
 
-// Heartbeat rule and its stated timeouts, with timer stalls.
-const beat = (state, at) => heartbeatTick(state, at);
-let hb = { lastInboundAt: now, lastTickAt: now, probeSince: null };
-let tick = beat(hb, now + HEARTBEAT_INTERVAL_MS);
+// Heartbeat rule and its stated timeouts, with timer stalls. Times are (wall, monotonic) in ms.
+const state = (inbound, tickWall, tickMono = tickWall, probeSince = null) => ({ lastInboundMono: inbound, lastTickWall: tickWall, lastTickMono: tickMono, probeSince });
+let tick = heartbeatTick(state(0, 0), HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS);
 check("heartbeat: a recent frame pings", tick.action === "ping");
-hb = { lastInboundAt: now, lastTickAt: now + EXTENSION_SILENCE_TIMEOUT_MS - 1000, probeSince: null };
-check("heartbeat: steady ticks with a long silence drop the socket", beat(hb, now + EXTENSION_SILENCE_TIMEOUT_MS + 1000).action === "drop");
-hb = { lastInboundAt: now, lastTickAt: now, probeSince: null };
-tick = beat(hb, now + 5 * 60_000);
-check("a stalled tick (PC paused, clock jump) only probes with a ping", tick.action === "probe" && tick.state.probeSince === now + 5 * 60_000);
-check("a probe answered before the next tick keeps the connection", beat({ ...tick.state, lastInboundAt: tick.state.probeSince + 100 }, tick.state.probeSince + HEARTBEAT_INTERVAL_MS).action === "ping");
-check("a probe nobody answered drops it on the next tick", beat(tick.state, tick.state.probeSince + HEARTBEAT_INTERVAL_MS).action === "drop");
-check("a stall is more than a late-by-a-little tick", STALL_MS > HEARTBEAT_INTERVAL_MS && beat({ lastInboundAt: now, lastTickAt: now, probeSince: null }, now + HEARTBEAT_INTERVAL_MS + 3000).action === "ping");
+check("heartbeat: steady ticks with a long silence drop the socket", heartbeatTick(state(0, EXTENSION_SILENCE_TIMEOUT_MS - 10_000), EXTENSION_SILENCE_TIMEOUT_MS + 10_000, EXTENSION_SILENCE_TIMEOUT_MS + 10_000).action === "drop");
+tick = heartbeatTick(state(0, 0), 5 * 60_000, 5 * 60_000);
+check("a stalled tick (worker paused) only probes with a ping", tick.action === "probe" && tick.state.probeSince === 5 * 60_000);
+check("a probe answered before the next tick keeps the connection", heartbeatTick({ ...tick.state, lastInboundMono: tick.state.probeSince + 100 }, tick.state.lastTickWall + HEARTBEAT_INTERVAL_MS, tick.state.lastTickMono + HEARTBEAT_INTERVAL_MS).action === "ping");
+check("a probe nobody answered drops it on the next on-time tick", heartbeatTick(tick.state, tick.state.lastTickWall + HEARTBEAT_INTERVAL_MS, tick.state.lastTickMono + HEARTBEAT_INTERVAL_MS).action === "drop");
+const secondLate = heartbeatTick(tick.state, tick.state.lastTickWall + 5 * 60_000, tick.state.lastTickMono + 5 * 60_000);
+check("a SECOND late tick opens a new probe instead of dropping on the previous one", secondLate.action === "probe" && secondLate.state.probeSince === tick.state.lastTickMono + 5 * 60_000);
+const slept = heartbeatTick(state(0, 0), 8 * 3600_000, 30_000);
+check("the PC slept (wall clock ran, monotonic did not): probe", slept.action === "probe");
+check("the clock jumped back: probe, never a drop", heartbeatTick(state(0, 1_000_000), 100, 1_000_000 + 20_000).action === "probe");
+check("the clock jumped forward by an hour at an otherwise normal tick: probe", heartbeatTick(state(0, 0), 3600_000, HEARTBEAT_INTERVAL_MS).action === "probe");
+check("a tick late by a little is still a normal one", heartbeatTick(state(0, 0), HEARTBEAT_INTERVAL_MS + 3000, HEARTBEAT_INTERVAL_MS + 3000).action === "ping" && STALL_MS > HEARTBEAT_INTERVAL_MS);
 check("both timeouts are over two missed beats", EXTENSION_SILENCE_TIMEOUT_MS > 2 * HEARTBEAT_INTERVAL_MS && RELAY_SILENCE_TIMEOUT_MS > 2 * HEARTBEAT_INTERVAL_MS);
 
 console.log(`\n${passed} passed, ${failed} failed`);

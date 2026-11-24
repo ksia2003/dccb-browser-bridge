@@ -11,6 +11,8 @@ let clock = 1_800_000_000_000;
 let nextTimer = 1;
 const timers = new Map();
 Date.now = () => clock;
+let mono = 0; // monotonic clock: moves with time, but not with a pause (a sleeping PC)
+performance.now = () => mono;
 globalThis.setTimeout = (fn, ms = 0) => { const id = nextTimer++; timers.set(id, { at: clock + ms, fn, every: null }); return id; };
 globalThis.setInterval = (fn, ms = 0) => { const id = nextTimer++; timers.set(id, { at: clock + ms, fn, every: ms }); return id; };
 globalThis.clearTimeout = globalThis.clearInterval = (id) => { timers.delete(id); };
@@ -26,9 +28,9 @@ async function runDue() {
 }
 /** Move time forward step by step, running timers as they fall due. */
 async function advance(ms, step = 1000) {
-  for (let spent = 0; spent < ms; spent += step) { clock += Math.min(step, ms - spent); await runDue(); }
+  for (let spent = 0; spent < ms; spent += step) { const d = Math.min(step, ms - spent); clock += d; mono += d; await runDue(); }
 }
-/** A pause: the clock moves, no timer runs until the next tick. */
+/** A pause: the wall clock moves (the PC slept), the monotonic clock and the timers do not. */
 const pause = (ms) => { clock += ms; };
 
 // --- fake chrome ---------------------------------------------------------------------------------
@@ -44,6 +46,7 @@ let tabs = [];
 const tabCalls = { query: 0, removed: [] };
 let onMessage;
 let onAlarm;
+let onNavigationTarget;
 const withStub = (object) => new Proxy(object, { get: (target, key) => key in target ? target[key] : stub() });
 globalThis.chrome = new Proxy(Object.fromEntries(Object.entries({
   storage: { local: area(local), session: area(session), onChanged: stub() },
@@ -53,6 +56,7 @@ globalThis.chrome = new Proxy(Object.fromEntries(Object.entries({
   tabGroups: { async query() { return []; }, onRemoved: stub() },
   permissions: { async contains() { return true; } },
   action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
+  webNavigation: { onCreatedNavigationTarget: { addListener(fn) { onNavigationTarget = fn; } } },
 }).map(([name, value]) => [name, withStub(value)])), { get: (target, key) => key in target ? target[key] : stub() });
 
 // --- fake WebSocket ------------------------------------------------------------------------------
@@ -85,7 +89,7 @@ function check(name, value, detail = "") {
   if (value) { passed++; console.log(`  PASS  ${name}`); }
   else { failed++; console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`); }
 }
-const binding = { type: "relay_binding", relay_binding: "home:alice:1", browser_id: "x" };
+const binding = { type: "relay_binding", relay_binding: "home:alice:1", browser_id: "x", switched_off_notice: true };
 const popup = (request) => new Promise(resolve => { onMessage(request, {}, resolve); });
 
 // --- boot ----------------------------------------------------------------------------------------
@@ -182,9 +186,8 @@ refreshAnswer = () => new Response(JSON.stringify({ access_token: "access-3", re
 await advance(31_000);
 check("... and the next attempt succeeds and stores the new login", local.get("v8BrowserBridgeProfile")?.refreshToken === "refresh-3");
 
-// 7. Switching off: an unbound socket loses the notice unless it is kept and delivered later.
+// 7. Switching off with no bound socket: the notice is kept, and only the relay's ack clears it.
 const sixth = live().at(-1) ?? fifth;
-// Make the live socket an unbound one: drop it and let the next attempt hang before binding.
 sixth.emit("close", { code: 1006, reason: "" });
 await flush();
 await advance(2000);
@@ -195,17 +198,28 @@ await flush();
 check("the off-notice is kept when no bound socket can carry it", local.get("v8BrowserBridgeOffNoticePending") === true && hanging.framesOf("extension_switched_off").length === 0);
 await advance(1000);
 const notice = last();
-check("a notice-only connection is opened while switched off", notice !== hanging && notice.protocols[0]?.startsWith("bb-bearer."));
+check("a notice-only connection (?notice=1) is opened while switched off", notice !== hanging && new URL(notice.url).searchParams.get("notice") === "1" && notice.protocols[0]?.startsWith("bb-bearer."));
 notice.open();
 notice.receive({ type: "tool_request", id: "off1", tool: "extension", args: {} });
 await advance(500);
 check("the notice connection carries the notice and takes no work", notice.framesOf("extension_switched_off").length === 1 && notice.framesOf("tool_response").length === 0);
-check("the stored notice is cleared once delivered", local.get("v8BrowserBridgeOffNoticePending") === undefined);
+check("the stored notice stays until the relay acknowledges it", local.get("v8BrowserBridgeOffNoticePending") === true);
+notice.emit("close", { code: 1006, reason: "" }); // the connection died before an ack
+await advance(1000);
+local.set("v8BrowserBridgeOffNoticePending", true);
+onAlarm({ name: "bb-reconnect" }); // the alarm retries
+await advance(1000);
+const retry = last();
+check("an unacknowledged notice is retried", retry !== notice && new URL(retry.url).searchParams.get("notice") === "1");
+retry.open();
+retry.receive({ type: "switched_off_ack", applied: true });
+await advance(500);
+check("the relay's acknowledgement clears the stored notice", local.get("v8BrowserBridgeOffNoticePending") === undefined);
 const socketsAfterOff = FakeWebSocket.instances.length;
 await advance(90_000);
 check("and nothing reconnects while it is off", FakeWebSocket.instances.length === socketsAfterOff);
 
-// 8. Switching off waits for in-flight work before it counts the AI's tabs.
+// 8. Switching off: work that may open tabs is aborted or awaited, and a child adopted meanwhile is closed.
 await popup({ type: "setEnabled", enabled: true });
 await advance(2000);
 const seventh = last();
@@ -216,15 +230,23 @@ tabs = [{ id: 5, windowId: 1, url: "https://example.com", title: "x" }];
 let finishTool;
 register("opens-tab", () => new Promise(resolve => { finishTool = resolve; }));
 seventh.receive({ type: "tool_request", id: "w1", tool: "opens-tab", args: {} });
+// A fetch whose response body never ends must not hold the shutdown.
+const realFetch = globalThis.fetch;
+globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+seventh.receive({ type: "tool_request", id: "w2", tool: "fetch", args: { url: "https://stalled.example/" } });
 await flush();
 const off = popup({ type: "setEnabled", enabled: false });
 await flush();
-check("the live socket got the off-notice before closing", seventh.framesOf("extension_switched_off").length === 1);
 check("no tab is closed while work that may open one is still running", tabCalls.removed.length === 0);
+// A child page opened by the AI's tab is confirmed while the shutdown is under way.
+onNavigationTarget({ tabId: 6, sourceTabId: 5, sourceFrameId: 0, url: "https://child.example/", timeStamp: 1 });
+await flush();
 finishTool("done");
 await off;
 await flush();
-check("after the work settled the AI's tabs are counted and closed", tabCalls.removed.includes(5));
+check("the stalled fetch was aborted, so the shutdown finished without waiting out its drain timer", tabCalls.removed.includes(5));
+check("a child tab confirmed during the shutdown is closed too", tabCalls.removed.includes(6), JSON.stringify(tabCalls.removed));
+globalThis.fetch = realFetch;
 
 console.log = realLog;
 console.log(`\n${passed} passed, ${failed} failed`);

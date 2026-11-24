@@ -38,14 +38,15 @@ const REASONS: Record<ConnectionIssue, string> = {
 };
 
 /**
- * `outageStartedAt` is when the current outage began (the first failure after being connected); the
- * "how long" and the "last connected" row count from it. `lastConnectedAt` is when a socket was last
- * bound, which can be days before the outage started for a connection that held for a long time, so it
- * only stands in when no outage start is known (and says "never" when it is null).
+ * `outageStartedAt` is when the first failure of the current outage was observed (cleared on connect and
+ * on switching off, stored across worker restarts). "How long" and the "long outage" wording count from
+ * it only. Without it (no failure seen yet: just started, just switched on) the connection is simply being
+ * made, and `lastConnectedAt` (when a socket was last bound, possibly days of deliberate downtime ago) is
+ * shown as information, never as an outage length.
  */
 export function describeConnecting(input: { lastConnectedAt: number | null; outageStartedAt?: number | null; nextRetryAt: number | null; retryReason: ConnectionIssue | null; now: number }): ConnectionDetail {
   const { lastConnectedAt, nextRetryAt, retryReason, now } = input;
-  const since = input.outageStartedAt ?? lastConnectedAt;
+  const since = input.outageStartedAt ?? null;
   const rows: { label: string; value: string }[] = [];
   const next = nextRetryAt !== null ? { label: "다음 시도", value: formatIn(nextRetryAt - now) } : null;
   if (lastConnectedAt === null) {
@@ -55,10 +56,12 @@ export function describeConnecting(input: { lastConnectedAt: number | null; outa
     if (next) rows.push(next);
     return { title: "서버에 연결하지 못했습니다", desc: "주소가 맞는지, 이 PC가 서버에 닿는지 확인해 주세요.\n알아서 다시 시도합니다.", rows };
   }
-  rows.push({ label: "마지막 연결", value: formatAgo(now - since!) });
+  // "Last connected" is when the outage began, if one has; otherwise the last time a socket was bound.
+  rows.push({ label: "마지막 연결", value: formatAgo(now - (since ?? lastConnectedAt)) });
   if (retryReason !== null) rows.push({ label: "원인", value: REASONS[retryReason] });
   if (next) rows.push(next);
-  if (now - since! >= LONG_GAP_MS) {
+  if (since === null) return { title: "연결하는 중", desc: "서버에 연결하고 있습니다.", rows };
+  if (now - since >= LONG_GAP_MS) {
     return { title: "서버에 연결되지 않음", desc: "서버가 켜져 있는지, 이 PC가 서버에 닿는지 확인해 주세요.\n알아서 계속 시도합니다.", rows };
   }
   return { title: "다시 연결하는 중", desc: "서버와 잠깐 끊겼습니다.\n알아서 다시 잇습니다.", rows };
