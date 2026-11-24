@@ -38,7 +38,7 @@ function startRelay() {
     stdio: "ignore",
   });
 }
-async function extension(id, name = "Laptop", token = null) {
+async function extension(id, name = "Laptop", token = null, respond = true) {
   let socket;
   for (let attempt = 0; ; attempt++) {
     const query = `${id ? `id=${id}&` : ""}name=${encodeURIComponent(name)}`;
@@ -52,7 +52,7 @@ async function extension(id, name = "Laptop", token = null) {
   socket.send(JSON.stringify({ type: "extension_hello", version: "6.0.2" }));
   socket.on("message", data => {
     const message = JSON.parse(String(data));
-    if (message.type === "tool_request") socket.send(JSON.stringify({ type: "tool_response", id: message.id, result: { ok: true } }));
+    if (respond && message.type === "tool_request") socket.send(JSON.stringify({ type: "tool_response", id: message.id, result: { ok: true } }));
   });
   return socket;
 }
@@ -171,6 +171,71 @@ try {
   assert.ok(JSON.parse(readFileSync(join(temp, "state/switched-off.json"), "utf8")).entries.sleepy === undefined);
   console.log("  PASS  switching it back on clears the stored record (503 no_extension after a restart)");
 
+  // A tool_response is accepted only from the socket the request went to.
+  const target = await extension("target-one", "Target", null, false);
+  const bystander = await extension("bystander", "Bystander");
+  const requestSeen = new Promise(resolve => target.on("message", data => { const m = JSON.parse(String(data)); if (m.type === "tool_request") resolve(m); }));
+  await sleep(300);
+  const answered = call("/send", { tool: "extension", args: {}, target: "target-one" });
+  const request = await requestSeen;
+  bystander.send(JSON.stringify({ type: "tool_response", id: request.id, result: { forged: true } }));
+  await sleep(300);
+  target.send(JSON.stringify({ type: "tool_response", id: request.id, result: { genuine: true } }));
+  const answer = await answered;
+  assert.deepEqual(answer.body.result, { genuine: true }, "another socket cannot settle a request by id");
+  target.close(); bystander.close();
+  await sleep(300);
+  console.log("  PASS  a tool_response from a socket the request was not sent to is ignored");
+
+  // The notice-only connection: authenticated, not a browser, acknowledged, durable, and stale after a switch-on.
+  const sendNotice = (token, id) => new Promise((resolve, reject) => {
+    const notice = new WebSocket(`ws://127.0.0.1:${wsPort}/ws?id=${id}&name=NoticeName&notice=1`, [`bb-bearer.${token}`], { headers: { Origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" } });
+    notice.once("error", reject);
+    notice.once("open", () => notice.send(JSON.stringify({ type: "extension_switched_off" })));
+    notice.on("message", data => { resolve(JSON.parse(String(data))); });
+  });
+  const connectedBefore = (await call("/browsers")).body.browsers?.length ?? 0;
+  const noticeAck = await sendNotice("tokB", idB);
+  assert.equal(noticeAck.type, "switched_off_ack");
+  assert.equal(noticeAck.applied, true);
+  const afterNotice = await call("/browsers");
+  assert.equal(afterNotice.body.switched_off?.find(entry => entry.id === idB)?.name, "NoticeName");
+  assert.equal((afterNotice.body.browsers ?? []).length, connectedBefore, "the notice connection is not a browser");
+  assert.equal(JSON.parse(readFileSync(join(temp, "state/switched-off.json"), "utf8")).entries[idB].name, "NoticeName", "recorded durably");
+  const reply2 = await call("/send", { tool: "extension", args: {}, target: idB });
+  assert.match(reply2.body.error, /switched Browser Bridge off/);
+  console.log("  PASS  the notice-only connection records the switch-off, is acknowledged, and is never a browser");
+  assert.equal((await sendNotice("tokA1", idB).then(() => "accepted", () => "refused")), "refused", "another browser's login cannot send a notice for this id");
+  const live = await extension(idB, "B", "tokB");
+  await sleep(300);
+  const staleAck = await sendNotice("tokB", idB);
+  assert.equal(staleAck.applied, false, "a notice for a Chrome that is connected right now is stale");
+  assert.ok(!((await call("/browsers")).body.switched_off ?? []).some(entry => entry.id === idB), "and no record is left for it");
+  live.close();
+  await sleep(300);
+  console.log("  PASS  a stale notice (the person switched on again) is acknowledged but not applied");
+
+  // The first 6.0.2 builds wrote switched-off.json as a flat id map: its unexpired records are kept.
+  const [wsPort3, httpPort3] = [await free(), await free()];
+  mkdirSync(join(temp, "state3"), { recursive: true });
+  writeFileSync(join(temp, "state3/switched-off.json"), JSON.stringify({ oldrecord: { name: "Old", at: new Date().toISOString() }, expired: { name: "Gone", at: "2020-01-01T00:00:00.000Z" } }));
+  const migrated = spawn(process.execPath, [join(root, "node_modules/tsx/dist/cli.mjs"), "server/index.ts"], {
+    cwd: root,
+    env: { ...process.env, BB_V6_TOKENS_FILE: join(temp, "state3/tokens.json"), BRIDGE_BIND_HOST: "127.0.0.1", BRIDGE_WS_PORT: String(wsPort3), BRIDGE_HTTP_PORT: String(httpPort3), BRIDGE_TRUST_LOCAL: "1" },
+    stdio: "ignore",
+  });
+  try {
+    const secret3Path = join(temp, "state3/http-control.secret");
+    for (let i = 0; i < 100 && !existsSync(secret3Path); i++) await sleep(100);
+    const secret3 = readFileSync(secret3Path, "utf8").trim();
+    let listing;
+    for (let i = 0; i < 50 && !listing; i++) { listing = await fetch(`http://127.0.0.1:${httpPort3}/browsers`, { headers: { "x-dccb-relay-secret": secret3 } }).then(r => r.json()).catch(() => null); if (!listing) await sleep(200); }
+    assert.deepEqual(listing.switched_off?.map(entry => entry.id), ["oldrecord"], "the flat file's unexpired record survived the upgrade, the expired one did not");
+    console.log("  PASS  a flat switched-off file from an earlier build is migrated, not dropped");
+  } finally {
+    migrated.kill("SIGTERM");
+  }
+
   // Expired records are pruned while the relay keeps running, and the file is rewritten.
   const [wsPort2, httpPort2] = [await free(), await free()];
   mkdirSync(join(temp, "state2"), { recursive: true });
@@ -205,7 +270,7 @@ try {
   } finally {
     short.kill("SIGTERM");
   }
-  console.log("\n9 passed");
+  console.log("\n12 passed");
 } finally {
   relay.kill("SIGTERM");
   await sleep(300);

@@ -109,6 +109,12 @@ function readHttpControlSecret(): string {
 
 interface TokenEntry {
   clientId: string;
+  /**
+   * The stable browser id this login was enrolled for. `clientId` joins person and id with hyphens, so
+   * two different pairs can print the same clientId; logins are grouped by {@link loginKey}, which uses
+   * the structured fields. Entries written before this field get it derived at load.
+   */
+  browserId?: string;
   createdAt: number;
   expiresAt: number;
   /**
@@ -128,8 +134,9 @@ interface TokenEntry {
    * costs nothing and a retry loop mints nothing.
    */
   rotatedTo?: string;
-  rotationAccess?: string;
-  /** In-memory count of grace retries served (bounded by MAX_GRACE_REPLAYS). */
+  /** The exact response the rotation gave, replayed verbatim (stable `expires_in`) inside the grace. */
+  rotationResult?: { access_token: string; refresh_token: string; expires_in: number };
+  /** Grace retries served so far; stored with the record so a restart does not reset the bound. */
   replays?: number;
 }
 
@@ -144,6 +151,20 @@ export interface EnrollmentTokenBinding {
   boxId: string;
   relayBinding: string;
   homeWsEndpoint: string;
+}
+
+/** Identity of a browser's logins: the structured route identity plus the enrolled browser id (never a joined string). */
+function loginKey(entry: TokenEntry): string {
+  const binding = entry.enrollmentBinding;
+  return binding && entry.browserId ? JSON.stringify([binding.person, binding.boxId, entry.browserId]) : JSON.stringify(["client", entry.clientId]);
+}
+
+/** Entries written before `browserId` existed: take it from the clientId by the recorded person's prefix. */
+function migrateEntry(entry: TokenEntry): TokenEntry {
+  const person = entry.enrollmentBinding?.person;
+  const prefix = person === undefined ? null : `v8-${person}-`;
+  if (entry.browserId === undefined && prefix && entry.clientId.startsWith(prefix)) entry.browserId = entry.clientId.slice(prefix.length);
+  return entry;
 }
 
 // --- In-memory stores -------------------------------------------------------
@@ -183,7 +204,12 @@ function persist(): boolean {
     try {
       const folder = openSync(directory, constants.O_RDONLY);
       try { fsyncSync(folder); } finally { closeSync(folder); }
-    } catch { /* the rename is done; a folder fsync is best-effort on filesystems that refuse it */ }
+    } catch (error) {
+      // A filesystem that cannot sync a folder at all (EINVAL/ENOTSUP) has nothing more to offer; any
+      // other error (EIO, ENOSPC...) means the rename may not be durable, which is a failure.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EISDIR" && code !== "EPERM") throw error;
+    }
     return true;
   } catch (e) {
     log("failed to persist tokens:", (e as Error).message);
@@ -203,6 +229,9 @@ function transaction(change: () => void): boolean {
   accessTokens.clear(); refreshTokens.clear();
   for (const [k, v] of before.access) accessTokens.set(k, v);
   for (const [k, v] of before.refresh) refreshTokens.set(k, v);
+  // The file may have been replaced before the failure (a folder sync error comes after the rename):
+  // write the rolled-back state back, best-effort, so disk and memory agree again.
+  persist();
   return false;
 }
 
@@ -216,13 +245,13 @@ export function loadTokensFromDisk(): void {
     let skipped = 0;
     for (const [k, e] of Object.entries(data.accessTokens ?? {})) {
       if (now < e.expiresAt) {
-        accessTokens.set(k, e);
+        accessTokens.set(k, migrateEntry(e));
         access++;
       } else skipped++;
     }
     for (const [k, e] of Object.entries(data.refreshTokens ?? {})) {
       if (now < e.expiresAt) {
-        refreshTokens.set(k, e);
+        refreshTokens.set(k, migrateEntry(e));
         refresh++;
       } else skipped++;
     }
@@ -246,19 +275,20 @@ function newToken(): string {
  * Mint a bearer pair for a completed V8 enrollment, retaining its approved route on refresh.
  * Throws when the store cannot be written: a login the relay could not record must not be handed out.
  */
-export function issueEnrollmentTokens(clientId: string, enrollmentBinding?: EnrollmentTokenBinding): TokenResponse {
+export function issueEnrollmentTokens(clientId: string, enrollmentBinding?: EnrollmentTokenBinding, browserId?: string): TokenResponse {
   const now = Date.now();
   const accessToken = newToken();
   const refreshToken = newToken();
   // Larger than any earlier login of this browser even if two redeems land in the same millisecond.
-  const family = Math.max(now, latestFamily(clientId) + 1);
+  const probe: TokenEntry = { clientId, createdAt: now, expiresAt: now, ...(browserId ? { browserId } : {}), ...(enrollmentBinding ? { enrollmentBinding } : {}) };
+  const family = Math.max(now, latestFamily(loginKey(probe)) + 1);
   const committed = transaction(() => {
     accessTokens.set(accessToken, {
-      clientId, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000, family,
+      clientId, ...(browserId ? { browserId } : {}), createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000, family,
       ...(enrollmentBinding ? { enrollmentBinding } : {}),
     });
     refreshTokens.set(refreshToken, {
-      clientId, createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000, family,
+      clientId, ...(browserId ? { browserId } : {}), createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000, family,
       ...(enrollmentBinding ? { enrollmentBinding } : {}),
     });
   });
@@ -271,10 +301,10 @@ export function issueEnrollmentTokens(clientId: string, enrollmentBinding?: Enro
   };
 }
 
-function latestFamily(clientId: string): number {
+function latestFamily(key: string): number {
   let latest = 0;
   for (const entry of [...accessTokens.values(), ...refreshTokens.values()]) {
-    if (entry.clientId === clientId) latest = Math.max(latest, entry.family ?? 0);
+    if (loginKey(entry) === key) latest = Math.max(latest, entry.family ?? 0);
   }
   return latest;
 }
@@ -283,11 +313,11 @@ function latestFamily(clientId: string): number {
  * Re-enrolling a browser (same clientId = person + stable browser id) leaves its earlier logins behind.
  * Removes them from the stores (the caller commits) and returns true when any went.
  */
-function retireOlderLogins(clientId: string, family: number): boolean {
+function retireOlderLogins(login: string, family: number): boolean {
   let changed = false;
   for (const map of [accessTokens, refreshTokens]) {
     for (const [key, entry] of map) {
-      if (entry.clientId === clientId && (entry.family ?? 0) < family) {
+      if (loginKey(entry) === login && (entry.family ?? 0) < family) {
         map.delete(key);
         changed = true;
       }
@@ -296,7 +326,7 @@ function retireOlderLogins(clientId: string, family: number): boolean {
   return changed;
 }
 
-interface SessionWatch { clientId: string; family: number; onEnd: () => void }
+interface SessionWatch { login: string; family: number; onEnd: () => void }
 const sessionWatches = new Set<SessionWatch>();
 
 /**
@@ -304,14 +334,14 @@ const sessionWatches = new Set<SessionWatch>();
  * superseded connection stops forwarding at once instead of at the next poll. Returns the unsubscribe.
  */
 export function watchSession(session: SessionHandle, onEnd: () => void): () => void {
-  const watch: SessionWatch = { ...session, onEnd };
+  const watch: SessionWatch = { login: session.login, family: session.family, onEnd };
   sessionWatches.add(watch);
   return () => { sessionWatches.delete(watch); };
 }
 
-function announceRetired(clientId: string, family: number): void {
+function announceRetired(login: string, family: number): void {
   for (const watch of [...sessionWatches]) {
-    if (watch.clientId === clientId && watch.family < family) watch.onEnd();
+    if (watch.login === login && watch.family < family) watch.onEnd();
   }
 }
 
@@ -322,9 +352,9 @@ function announceRetired(clientId: string, family: number): void {
  */
 export function activateLogin(session: SessionHandle): boolean {
   let retired = false;
-  const committed = transaction(() => { retired = retireOlderLogins(session.clientId, session.family); });
+  const committed = transaction(() => { retired = retireOlderLogins(session.login, session.family); });
   if (!committed) return false;
-  if (retired) announceRetired(session.clientId, session.family);
+  if (retired) announceRetired(session.login, session.family);
   return true;
 }
 
@@ -395,45 +425,41 @@ export function handleRefresh(body: { refresh_token?: string; accepts_rotation?:
     if (entry) transaction(() => { refreshTokens.delete(body.refresh_token!); });
     return err(401, "invalid_token");
   }
+  const rotate = body.accepts_rotation === true;
   if (entry.rotatedTo) {
-    // A retry of a rotation whose response may have been lost: the same result, nothing new minted.
-    const successor = refreshTokens.get(entry.rotatedTo);
-    if (!successor || !entry.rotationAccess || !findValidAccessToken(entry.rotationAccess) || (entry.replays ?? 0) >= MAX_GRACE_REPLAYS) {
+    // A retry of a rotation whose response may have been lost: the same stored result, nothing new
+    // minted. Only a client that asked for rotation can hold a rotated token, so only it may replay.
+    const result = entry.rotationResult;
+    if (!rotate || !result || !refreshTokens.has(entry.rotatedTo) || !findValidAccessToken(result.access_token) || (entry.replays ?? 0) >= MAX_GRACE_REPLAYS) {
       return err(401, "invalid_token");
     }
-    entry.replays = (entry.replays ?? 0) + 1;
-    return {
-      status: 200,
-      body: { access_token: entry.rotationAccess, refresh_token: entry.rotatedTo, token_type: "bearer", expires_in: Math.max(1, Math.floor((accessTokens.get(entry.rotationAccess)!.expiresAt - now) / 1000)) },
-    };
+    // The count is part of the stored record, so a relay restart does not reset the bound.
+    if (!transaction(() => { entry.replays = (entry.replays ?? 0) + 1; })) return err(503, "server_error");
+    return { status: 200, body: { ...result, token_type: "bearer" } };
   }
-  const rotate = body.accepts_rotation === true;
   const accessToken = newToken();
   const refreshToken = rotate ? newToken() : undefined;
-  let retired = false;
+  const same = {
+    clientId: entry.clientId,
+    ...(entry.browserId !== undefined ? { browserId: entry.browserId } : {}),
+    ...(entry.family !== undefined ? { family: entry.family } : {}),
+    ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
+  };
+  // A refresh does NOT retire older logins: that happens only when a newer login's connection is admitted
+  // (activateLogin). A login that refreshes before it ever connected must not take a working one away.
   const committed = transaction(() => {
-    accessTokens.set(accessToken, {
-      clientId: entry.clientId, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000,
-      ...(entry.family !== undefined ? { family: entry.family } : {}),
-      ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
-    });
+    accessTokens.set(accessToken, { ...same, createdAt: now, expiresAt: now + ACCESS_TOKEN_TTL_S * 1000 });
     if (refreshToken) {
-      refreshTokens.set(refreshToken, {
-        clientId: entry.clientId, createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000,
-        ...(entry.family !== undefined ? { family: entry.family } : {}),
-        ...(entry.enrollmentBinding ? { enrollmentBinding: entry.enrollmentBinding } : {}),
-      });
+      refreshTokens.set(refreshToken, { ...same, createdAt: now, expiresAt: now + REFRESH_TOKEN_TTL_S * 1000 });
       // The used token lives only for the grace window (never longer than it already had).
       entry.rotatedTo = refreshToken;
-      entry.rotationAccess = accessToken;
+      entry.rotationResult = { access_token: accessToken, refresh_token: refreshToken, expires_in: ACCESS_TOKEN_TTL_S };
       entry.expiresAt = Math.min(entry.expiresAt, now + ROTATION_GRACE_S * 1000);
     } else {
       entry.expiresAt = now + REFRESH_TOKEN_TTL_S * 1000;
     }
-    retired = retireOlderLogins(entry.clientId, entry.family ?? 0);
   });
   if (!committed) return err(503, "server_error");
-  if (retired) announceRetired(entry.clientId, entry.family ?? 0);
   return {
     status: 200,
     body: {
@@ -454,13 +480,6 @@ export interface BearerCheck {
   clientId?: string;
   /** The stable browser id this login was enrolled for; the relay binds a connection's id to it. */
   browserId?: string;
-}
-
-/** The browser id inside a V8 clientId (`v8-<person>-<browserId>`), taken by the person the route recorded. */
-function browserIdOf(entry: TokenEntry): string | undefined {
-  const person = entry.enrollmentBinding?.person;
-  const prefix = person === undefined ? null : `v8-${person}-`;
-  return prefix && entry.clientId.startsWith(prefix) ? entry.clientId.slice(prefix.length) : undefined;
 }
 
 /**
@@ -497,7 +516,7 @@ export function checkWsBearer(opts: {
   const entry = findValidAccessToken(token);
   if (!entry) return { ok: false };
   // Validation only: the login becomes the browser's login at admission (activateLogin), not here.
-  return { ok: true, acceptProtocol, clientId: entry.clientId, browserId: browserIdOf(entry) };
+  return { ok: true, acceptProtocol, clientId: entry.clientId, browserId: entry.browserId };
 }
 
 /** Whether an access bearer is currently valid (a connection's mid-session check is {@link isSessionLive}). */
@@ -506,11 +525,11 @@ export function isAccessTokenValid(token: string): boolean {
 }
 
 /** The login a live connection was opened with; see {@link isSessionLive}. */
-export interface SessionHandle { clientId: string; family: number }
+export interface SessionHandle { login: string; family: number }
 
 export function sessionForAccessToken(token: string): SessionHandle | null {
   const entry = findValidAccessToken(token);
-  return entry ? { clientId: entry.clientId, family: entry.family ?? 0 } : null;
+  return entry ? { login: loginKey(entry), family: entry.family ?? 0 } : null;
 }
 
 /**
@@ -523,7 +542,7 @@ export function sessionForAccessToken(token: string): SessionHandle | null {
 export function isSessionLive(session: SessionHandle): boolean {
   const now = Date.now();
   for (const entry of refreshTokens.values()) {
-    if (entry.clientId === session.clientId && (entry.family ?? 0) === session.family && now < entry.expiresAt) return true;
+    if (loginKey(entry) === session.login && (entry.family ?? 0) === session.family && now < entry.expiresAt) return true;
   }
   return false;
 }

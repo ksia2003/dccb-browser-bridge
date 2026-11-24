@@ -132,8 +132,11 @@ const SWITCHED_OFF_KEEP_MS = Number(process.env.BB_SWITCHED_OFF_KEEP_MS) || 30 *
  */
 function loadSwitchedOff(): void {
   try {
-    const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as { entries?: Record<string, { name?: unknown; at?: unknown; address?: unknown }>; lastGone?: unknown };
-    for (const [id, v] of Object.entries(data.entries ?? {})) {
+    const data = JSON.parse(readFileSync(SWITCHED_OFF_FILE, "utf8")) as { version?: unknown; entries?: Record<string, { name?: unknown; at?: unknown; address?: unknown }>; lastGone?: unknown };
+    // The first 6.0.2 builds wrote a flat {id: record} map. Keep its unexpired records; which Chrome left
+    // last is unknown there, so `lastGone` stays null (a restart answers no_extension until a switch-off).
+    const records = data.version === 2 && data.entries ? data.entries : (data as unknown as Record<string, { name?: unknown; at?: unknown; address?: unknown }>);
+    for (const [id, v] of Object.entries(records)) {
       if (typeof v?.name !== "string" || typeof v.at !== "string" || !(Date.now() - Date.parse(v.at) < SWITCHED_OFF_KEEP_MS)) continue;
       switchedOff.set(id, { name: v.name, at: v.at, ...(typeof v.address === "string" ? { address: v.address } : {}) });
     }
@@ -367,7 +370,9 @@ wsHttp.on("upgrade", (req, socket, head) => {
   // `handleProtocols` (set on the WebSocketServer) already echoes the
   // `bb-bearer.*` subprotocol back into the 101, so no per-upgrade options are
   // needed here. handleUpgrade's signature is (request, socket, head, cb).
+  const notice = url.searchParams.get("notice") === "1";
   wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+    if (notice) { handleNotice(ws, req, { id: selfId, name: selfName }); return; }
     handleConnection(ws, req, subprotocols, {
       id: selfId,
       name: selfName,
@@ -403,6 +408,37 @@ function isTrustedLocalAccount(socket: { remotePort?: number; localPort?: number
 /** Only the legacy same-box loopback path may omit a bearer, and only from this account or the door. */
 function isTrustedSource(socket: Duplex): boolean {
   return TRUST_LOCAL && isLoopback(socket) && isTrustedLocalAccount(socket as { remotePort?: number; localPort?: number });
+}
+
+/**
+ * The notice-only connection (`/ws?notice=1`): an authenticated way for a switched-off Chrome (which
+ * holds no bridge socket) to tell the relay the person switched it off. It is NOT a browser: it is
+ * never registered, never dispatched to, activates no login and replaces no socket. It takes one
+ * `extension_switched_off`, records it durably, answers `switched_off_ack`, and closes. A notice is
+ * stale (applied: false) when that Chrome is connected right now, i.e. the person switched it on again.
+ */
+function handleNotice(ws: WebSocket, req: IncomingMessage, identity: { id?: string; name?: string }): void {
+  const id = identity.id;
+  if (!id) { ws.close(1008, "id_required"); return; }
+  const timer = setTimeout(() => ws.close(1000, "timeout"), 10_000);
+  ws.on("close", () => clearTimeout(timer));
+  ws.on("error", () => undefined);
+  ws.on("message", (data) => {
+    let msg: BridgeMessage;
+    try { msg = JSON.parse(data.toString()) as BridgeMessage; } catch { return; }
+    if (msg?.type !== "extension_switched_off") return;
+    let applied = false;
+    if (!browsers.has(id)) {
+      const from = req.socket.remoteAddress?.replace("::ffff:", "");
+      switchedOff.set(id, { name: identity.name || id, at: new Date().toISOString(), ...(from && from !== "127.0.0.1" && from !== "::1" ? { address: from } : {}) });
+      lastGoneSwitchedOff = id;
+      saveSwitchedOff();
+      log(`switched-off notice recorded for ${id}`);
+      applied = true;
+    }
+    send(ws, { type: "switched_off_ack", applied });
+    ws.close(1000, "done");
+  });
 }
 
 function handleConnection(
@@ -467,6 +503,7 @@ function handleConnection(
     browser_id: id,
     latest_extension_version: latestExtensionVersion,
     tab_group: browserBridgeTabGroupEnabled(),
+    switched_off_notice: true,
   });
 
   // If this connection was bearer-authed (not trusted-local), close 4401 once its LOGIN ends (refresh
@@ -550,7 +587,10 @@ function handleConnection(
       }
       case "tool_response": {
         const waiter = pending.get(msg.id);
-        if (waiter) {
+        // Only the socket a request went to may answer it: a request id is not a credential.
+        if (waiter && waiter.ws !== ws) {
+          log("tool_response from a socket the request was not sent to", msg.id);
+        } else if (waiter) {
           if (waiter.timer) clearTimeout(waiter.timer);
           pending.delete(msg.id);
           waiter.resolve(msg);
@@ -1007,8 +1047,9 @@ async function handleEnrollmentRedeem(req: IncomingMessage, res: ServerResponse)
     bearer = issueEnrollmentTokens(`v8-${route.person}-${route.browserId}`, {
       person: route.person, boxId: route.boxId, relayBinding: route.relayBinding,
       homeWsEndpoint: route.wsEndpoint,
-    });
+    }, route.browserId);
   } catch (error) {
+    enrollment.release(body.setup_code); // the person can retry with the same code
     log(`enrollment not completed: ${(error as Error).message}`);
     writeJson(res, 503, { error: "server_error" });
     return;

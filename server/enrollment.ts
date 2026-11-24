@@ -125,6 +125,15 @@ export class BrowserBridgeEnrollmentStore {
     record.redeemedAt = now;
     return { ok: true, value: { ...route, browserId } };
   }
+
+  /**
+   * Give a redeemed code back, for a redemption whose login could not be recorded (the token store was
+   * not writable): the person's retry with the same code then works instead of answering used_code.
+   */
+  release(setupCode: string): void {
+    const record = this.codes.get(normalizeCode(setupCode));
+    if (record) record.redeemedAt = null;
+  }
 }
 
 /** Environment adapter.  Deployment derives these values from the V8 declaration; no extension input supplies them. */

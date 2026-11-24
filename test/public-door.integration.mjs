@@ -34,12 +34,13 @@ const homeHttp = createServer();
 const homeWss = new WebSocketServer({ noServer: true });
 const homeUpgradeOrigins = [];
 const homeUpgradeUrls = [];
+let homeSendsBinding = true;
 homeHttp.on("upgrade", (req, socket, head) => {
   if (new URL(req.url, "http://localhost").pathname !== "/ws") { socket.destroy(); return; }
   homeUpgradeOrigins.push(req.headers.origin);
   homeUpgradeUrls.push(req.url);
   homeWss.handleUpgrade(req, socket, head, ws => {
-    ws.send(JSON.stringify({ type: "relay_binding", relay_binding: "home:bob:home-box", browser_id: "public_door_browser_0001" }));
+    if (homeSendsBinding) ws.send(JSON.stringify({ type: "relay_binding", relay_binding: "home:bob:home-box", browser_id: "public_door_browser_0001" }));
     ws.on("message", data => ws.send(data));
   });
 });
@@ -201,6 +202,35 @@ try {
   assert.equal(staleRefresh.status, 401);
   newLive.close();
   console.log("  PASS  re-enrolling: the older login ends at the newer one's admission");
+
+  // Admission is HOME's relay_binding, not an upstream 101; a refresh retires nothing.
+  const issue3 = await (await fetch(`http://127.0.0.1:${issuerPort}/api/enroll/issue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ person: "bob", box_id: "home-box" }) })).json();
+  const profile3 = await (await fetch(`http://127.0.0.1:${publicPort}/api/enroll/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setup_code: issue3.setup_code, stable_browser_id: "public_door_browser_0001" }) })).json();
+  const refreshWith = (token, rotate = false) => fetch(`http://127.0.0.1:${publicPort}/api/auth/refresh`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ refresh_token: token, ...(rotate ? { accepts_rotation: true } : {}) }) });
+  assert.equal((await refreshWith(profile3.refresh_token)).status, 200, "the newest login refreshes before it ever connected");
+  assert.equal((await refreshWith(profile2.refresh_token)).status, 200, "...and that retires nothing: the working login still refreshes");
+  homeSendsBinding = false;
+  const silentHome = new WebSocket(publicWsUrl, [`bb-bearer.${profile3.access_token}`]);
+  await new Promise((resolve, reject) => { silentHome.once("open", resolve); silentHome.once("error", reject); });
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal((await refreshWith(profile2.refresh_token)).status, 200, "HOME accepted the upgrade but never sent relay_binding: no admission, the older login stays");
+  silentHome.close();
+  homeSendsBinding = true;
+  const admitted = new WebSocket(publicWsUrl, [`bb-bearer.${profile3.access_token}`]);
+  await new Promise((resolve, reject) => { admitted.once("open", resolve); admitted.once("error", reject); });
+  assert.equal(JSON.parse(await nextMessage(admitted)).type, "relay_binding");
+  assert.equal((await refreshWith(profile2.refresh_token)).status, 401, "after HOME's relay_binding the newer login is admitted and the older one ends");
+  admitted.close();
+  console.log("  PASS  the door admits a new login on HOME's relay_binding only; refreshing retires nothing");
+
+  // The notice-only connection is relayed as such, and a frame sent before HOME is ready is not lost.
+  const noticeThroughDoor = new WebSocket(`ws://127.0.0.1:${publicPort}/ws?notice=1`, [`bb-bearer.${(await (await refreshWith(profile3.refresh_token)).json()).access_token}`]);
+  noticeThroughDoor.once("open", () => noticeThroughDoor.send(JSON.stringify({ type: "extension_switched_off" })));
+  const echoes = await new Promise(resolve => { const seen = []; noticeThroughDoor.on("message", data => { seen.push(data.toString()); if (seen.length === 2) resolve(seen); }); });
+  assert.ok(echoes.includes(JSON.stringify({ type: "extension_switched_off" })), "the early frame reached HOME (the mock echoes it)");
+  assert.match(homeUpgradeUrls.at(-1), /[?&]notice=1(&|$)/);
+  noticeThroughDoor.close();
+  console.log("  PASS  the door relays the notice-only connection and buffers frames sent before HOME is ready");
 
   // Another account on the box reaches the issuer over loopback too; it must not get this person's code.
   const foreign = startPublicDoor({

@@ -57,5 +57,13 @@ route = { ...route, relayBinding: "home:alice:2" };
 const mismatch = store.redeem(routeChanged.value.setupCode, "changed_route_browser_id_123");
 check("rejects a changed relay route rather than falling through to another relay", !mismatch.ok && mismatch.error === "route_mismatch", JSON.stringify(mismatch));
 
+const spent = store.issue({ person: "alice", boxId: "home-box", accessPath: "tailnet-direct" });
+const first = store.redeem(spent.value.setupCode, "release_browser_identifier_1");
+store.release(spent.value.setupCode);
+const again = store.redeem(spent.value.setupCode, "release_browser_identifier_1");
+check("a redemption whose login could not be recorded can be given back, so the same code works on retry", first.ok && again.ok, JSON.stringify([first, again]));
+const twice = store.redeem(spent.value.setupCode, "release_browser_identifier_1");
+check("a code that was not given back is still single-use", !twice.ok && twice.error === "used_code", JSON.stringify(twice));
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) process.exit(1);

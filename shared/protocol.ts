@@ -55,6 +55,16 @@ export interface ExtensionSwitchedOff {
 }
 
 /**
+ * Relay → extension, on the notice-only connection (`/ws?notice=1`): the switched-off notice was
+ * handled. `applied` is false when the relay saw the Chrome connected again meanwhile (a stale notice).
+ * Either way the extension may stop sending it.
+ */
+export interface SwitchedOffAck {
+  type: "switched_off_ack";
+  applied: boolean;
+}
+
+/**
  * Extension → relay: the person renamed this Chrome in the popup. The relay applies the name to the
  * live connection, so a rename no longer needs a reconnect (which ended the AI's running work). A relay
  * that does not know the frame ignores it; the new name then reaches it at the next natural reconnect
@@ -97,6 +107,8 @@ export interface RelayBinding {
   latest_extension_version?: string | null;
   /** HOME's optional Browser Bridge tab-group setting; absent means ungrouped. */
   tab_group?: boolean;
+  /** This relay understands the notice-only connection (`/ws?notice=1`); older relays would register it as a browser. */
+  switched_off_notice?: boolean;
 }
 
 /**
@@ -147,7 +159,7 @@ export interface PipeEvent {
 export const PIPE_MIN_EXTENSION_VERSION = "1.1.0";
 
 /** Any message that can cross the wire in either direction. */
-export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | ExtensionSwitchedOff | ExtensionRename | LatestExtensionVersion
+export type BridgeMessage = ToolRequest | ToolResponse | Ping | Pong | RelayBinding | ExtensionHello | ExtensionSwitchedOff | SwitchedOffAck | ExtensionRename | LatestExtensionVersion
   | PipeOpen | PipeClose | PipeCommand | PipeResponse | PipeEvent;
 
 /** Chrome's manifest version for this release line is three numeric components. */

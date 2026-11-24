@@ -249,11 +249,13 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
         }
         let redeemed: EnrollmentResult<RedeemedSetupCode> | null = null;
         let route: PublicDoorRoute | undefined;
+        let redeemedStore: BrowserBridgeEnrollmentStore | undefined;
         for (const [key, store] of stores) {
           const result = store.redeem(body.setup_code, body.stable_browser_id);
           // A code this route does not hold is another route's (or no one's): keep looking.
           if (result.ok || (result.error !== "route_unavailable" && result.error !== "unknown_code")) {
             redeemed = result;
+            redeemedStore = store;
             route = routes.get(key);
             break;
           }
@@ -270,8 +272,8 @@ export function startPublicDoor(options: PublicDoorStartOptions): RunningPublicD
           homeWsEndpoint: route.homeWsEndpoint,
         };
         let tokens;
-        try { tokens = issueEnrollmentTokens(`v8-${route.person}-${redeemed.value!.browserId}`, binding); }
-        catch { json(res, 503, { error: "server_error" }); return; }
+        try { tokens = issueEnrollmentTokens(`v8-${route.person}-${redeemed.value!.browserId}`, binding, redeemed.value!.browserId); }
+        catch { redeemedStore?.release(body.setup_code); json(res, 503, { error: "server_error" }); return; }
         const response: EnrollRedeemResponse = {
           ws_endpoint: route.wsEndpoint,
           relay_binding: route.relayBinding,
@@ -357,22 +359,29 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
   const browserName = incomingUrl.searchParams.get("name");
   if (browserId) homeUrl.searchParams.set("id", browserId);
   if (browserName) homeUrl.searchParams.set("name", browserName);
+  // The notice-only connection (a switched-off Chrome telling HOME so) is relayed as such: it takes no
+  // admission and activates no login.
+  const notice = incomingUrl.searchParams.get("notice") === "1";
+  if (notice) homeUrl.searchParams.set("notice", "1");
   const home = new WebSocket(homeUrl, { maxPayload: 0 });
   let closed = false;
-  let admitted = false;
+  let admitted = notice;
+  // Frames the browser sends before HOME is ready (its hello, a notice) wait here instead of vanishing.
+  let homeOpen = false;
+  const queued: { data: RawData; isBinary: boolean }[] = [];
   // The connection lives as long as the login it was opened with, not the 2 h access token (auth.ts isSessionLive).
   const session = sessionForAccessToken(bearer);
   let watch: ReturnType<typeof setInterval> | null = setInterval(() => {
     if (!session || !isSessionLive(session)) close(WS_CLOSE_UNAUTHORIZED, "login_ended");
   }, 30_000);
   const clearWatch = (): void => { if (watch) clearInterval(watch); watch = null; unwatch?.(); };
-  // Admission: the HOME relay accepted this browser. Only now does the new login retire its predecessors,
-  // and a connection of a replaced login stops at once.
+  // A connection of a login that a newer one replaced stops at once.
   const unwatch = session ? watchSession(session, () => close(WS_CLOSE_UNAUTHORIZED, "login_replaced")) : null;
+  const flush = (): void => { for (const frame of queued.splice(0)) forward(home, frame.data, frame.isBinary); };
   home.on("open", () => {
     if (closed) return;
-    if (!session || !activateLogin(session)) { close(1011, "state_unwritable"); return; }
-    admitted = true;
+    homeOpen = true;
+    if (notice) flush();
   });
   const close = (code: number, reason: string): void => {
     if (closed) return;
@@ -387,11 +396,25 @@ function bridgeToHome(browser: WebSocket, route: PublicDoorRoute, bearer: string
     if (target.readyState === WebSocket.OPEN) target.send(data, { binary: isBinary });
   };
   browser.on("message", (data, isBinary) => {
-    if (!admitted) return;
     if (!session || !isSessionLive(session)) { close(WS_CLOSE_UNAUTHORIZED, "login_ended"); return; }
-    forward(home, data, isBinary);
+    if (homeOpen && admitted) forward(home, data, isBinary);
+    else if (queued.length < 20) queued.push({ data, isBinary });
   });
-  home.on("message", (data, isBinary) => forward(browser, data, isBinary));
+  home.on("message", (data, isBinary) => {
+    if (!admitted) {
+      // Admission is HOME's own `relay_binding` for this route, not merely an upstream 101. Only then
+      // does the new login retire its predecessors (durably), and only then does anything flow.
+      let frame: { type?: unknown; relay_binding?: unknown } | null = null;
+      try { frame = JSON.parse(data.toString()); } catch { /* not a frame */ }
+      if (frame?.type !== "relay_binding" || frame.relay_binding !== route.relayBinding) return;
+      if (!session || !activateLogin(session)) { close(1011, "state_unwritable"); return; }
+      admitted = true;
+      forward(browser, data, isBinary);
+      flush();
+      return;
+    }
+    forward(browser, data, isBinary);
+  });
   browser.on("close", () => close(1000, "browser_closed"));
   // 1005/1006/1015 report how a connection ended and are never sent in a frame.
   home.on("close", (code, reason) => close(
