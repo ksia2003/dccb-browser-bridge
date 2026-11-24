@@ -167,9 +167,29 @@ export async function isControlledTab(tabId: number, workspace?: unknown): Promi
  * of the last focused normal window. One queue, so two engines never race for a window.
  */
 let creationQueue: Promise<unknown> = Promise.resolve();
+/**
+ * Switching Browser Bridge off retires every tab operation that started before it: `stopAiWork` bumps
+ * the generation and marks AI work stopped (until `resumeAiWork`). A tab whose creation or adoption
+ * finishes under a retired generation, or while stopped, is closed instead of kept, however late it
+ * completes (a slow Chrome can finish after the shutdown's sweeps).
+ */
+let switchGeneration = 0;
+let aiWorkStopped = false;
+export function stopAiWork(): void { switchGeneration++; aiWorkStopped = true; }
+export function resumeAiWork(): void { aiWorkStopped = false; }
+function retired(generation: number): boolean { return aiWorkStopped || generation !== switchGeneration; }
 export function createControlledTab(url?: string, workspace?: unknown): Promise<chrome.tabs.Tab> {
   const workspaceName = normalizeWorkspace(workspace);
-  const task = creationQueue.then(() => createClientTab(url, workspaceName));
+  const generation = switchGeneration;
+  const task = creationQueue.then(async () => {
+    if (retired(generation)) throw new Error("Browser Bridge was switched off");
+    const tab = await createClientTab(url, workspaceName);
+    if (retired(generation)) {
+      await removeAiTabs([tab.id!]).catch(() => undefined);
+      throw new Error("Browser Bridge was switched off");
+    }
+    return tab;
+  });
   creationQueue = task.catch(() => {});
   return task;
 }
@@ -438,17 +458,12 @@ async function seedBrowserSelection(): Promise<void> {
   }
 }
 
-/** Child tabs being adopted right now; switching off waits for them (and closes them, see `shuttingDown`). */
+/** Child tabs being adopted right now; switching off waits for them (and closes them, see `stopAiWork`). */
 const adoptions = new Set<Promise<unknown>>();
 export function pendingAdoptions(): Promise<unknown>[] { return [...adoptions]; }
-/**
- * True while Browser Bridge is being switched off: a child of an AI tab whose adoption finishes now is
- * closed instead of kept, because switching off closes every AI tab and the sweeps may already be done.
- */
-let shuttingDown = false;
-export function setShuttingDown(value: boolean): void { shuttingDown = value; }
 
 async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNavigationSourceCallbackDetails): Promise<void> {
+  const generation = switchGeneration;
   const tabId = details.tabId;
   if (handledNavigationTargets.has(tabId)) return;
   handledNavigationTargets.add(tabId);
@@ -463,7 +478,7 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       return;
     }
 
-    if (shuttingDown) { await removeAiTabs([tabId]).catch(() => undefined); return; }
+    if (retired(generation)) { await removeAiTabs([tabId]).catch(() => undefined); return; }
     const [child, source] = await Promise.all([
       chrome.tabs.get(tabId).catch(() => undefined),
       chrome.tabs.get(details.sourceTabId).catch(() => undefined),
@@ -496,11 +511,12 @@ async function handleCreatedNavigationTarget(details: chrome.webNavigation.WebNa
       await chrome.tabs.move(tabId, { windowId: source.windowId, index: -1 });
     }
     await setOwner(tabId, workspace);
-    if (shuttingDown) { await removeAiTabs([tabId]).catch(() => undefined); return; }
+    if (retired(generation)) { await removeAiTabs([tabId]).catch(() => undefined); return; }
     if (aiTabGroupingEnabled) await addToAiTabGroup(tabId);
     await muteAiTab(tabId);
     await restoreChildSelection(tabId, details.sourceTabId, source.windowId, restoreCandidate, activationMark);
     await restoreChildWindowFocus(originalWindowId, source.windowId, restoreCandidate, focusedBeforeMove, focusMark);
+    if (retired(generation)) { await removeAiTabs([tabId]).catch(() => undefined); return; }
     log("adopted target created by controlled page", {
       tabId, sourceTabId: details.sourceTabId, sourceFrameId: details.sourceFrameId,
       openerTabId: child.openerTabId ?? null,

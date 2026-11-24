@@ -44,6 +44,8 @@ const area = (map) => ({
 const stub = () => new Proxy(function () {}, { get: (_t, key) => key === "then" ? undefined : stub(), apply: () => Promise.resolve(undefined) });
 let tabs = [];
 const tabCalls = { query: 0, removed: [] };
+let createCalls = 0;
+let createGate = Promise.resolve();
 let onMessage;
 let onAlarm;
 let onNavigationTarget;
@@ -52,7 +54,8 @@ globalThis.chrome = new Proxy(Object.fromEntries(Object.entries({
   storage: { local: area(local), session: area(session), onChanged: stub() },
   runtime: { getManifest: () => ({ version: "6.0.2" }), getURL: (p) => p, onMessage: { addListener(fn) { onMessage = fn; } }, onInstalled: stub(), sendMessage: () => Promise.resolve() },
   alarms: { create() {}, onAlarm: { addListener(fn) { onAlarm = fn; } } },
-  tabs: { async query() { tabCalls.query++; return tabs; }, async remove(ids) { tabCalls.removed.push(...ids); tabs = tabs.filter(tab => !ids.includes(tab.id)); }, onRemoved: stub(), onUpdated: stub(), onCreated: stub(), onActivated: stub(), onAttached: stub(), onDetached: stub() },
+  windows: { async getLastFocused() { return { type: "normal", id: 1 }; } },
+  tabs: { async create() { createCalls++; await createGate; return { id: 9, windowId: 1, index: 3 }; }, async query() { tabCalls.query++; return tabs; }, async remove(ids) { tabCalls.removed.push(...ids); tabs = tabs.filter(tab => !ids.includes(tab.id)); }, onRemoved: stub(), onUpdated: stub(), onCreated: stub(), onActivated: stub(), onAttached: stub(), onDetached: stub() },
   tabGroups: { async query() { return []; }, onRemoved: stub() },
   permissions: { async contains() { return true; } },
   action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
@@ -198,7 +201,7 @@ await flush();
 check("the off-notice is kept when no bound socket can carry it", local.get("v8BrowserBridgeOffNoticePending") === true && hanging.framesOf("extension_switched_off").length === 0);
 await advance(1000);
 const notice = last();
-check("a notice-only connection (?notice=1) is opened while switched off", notice !== hanging && new URL(notice.url).searchParams.get("notice") === "1" && notice.protocols[0]?.startsWith("bb-bearer."));
+check("a notice-only connection on the dedicated /notice path is opened while switched off", notice !== hanging && new URL(notice.url).pathname === "/notice" && notice.protocols[0]?.startsWith("bb-bearer."));
 notice.open();
 notice.receive({ type: "tool_request", id: "off1", tool: "extension", args: {} });
 await advance(500);
@@ -210,7 +213,7 @@ local.set("v8BrowserBridgeOffNoticePending", true);
 onAlarm({ name: "bb-reconnect" }); // the alarm retries
 await advance(1000);
 const retry = last();
-check("an unacknowledged notice is retried", retry !== notice && new URL(retry.url).searchParams.get("notice") === "1");
+check("an unacknowledged notice is retried", retry !== notice && new URL(retry.url).pathname === "/notice");
 retry.open();
 retry.receive({ type: "switched_off_ack", applied: true });
 await advance(500);
@@ -247,6 +250,50 @@ await flush();
 check("the stalled fetch was aborted, so the shutdown finished without waiting out its drain timer", tabCalls.removed.includes(5));
 check("a child tab confirmed during the shutdown is closed too", tabCalls.removed.includes(6), JSON.stringify(tabCalls.removed));
 globalThis.fetch = realFetch;
+
+// 9. A tab creation that finishes after the shutdown's drain timed out and both sweeps ran is closed when it lands.
+await popup({ type: "setEnabled", enabled: true });
+await advance(2000);
+const eighth = live().at(-1) ?? last();
+eighth.open();
+eighth.receive(binding);
+await flush();
+let releaseCreate;
+createGate = new Promise(resolve => { releaseCreate = resolve; });
+tabCalls.removed.length = 0;
+eighth.receive({ type: "pipe_open", channel: "late-channel", workspace: "default" });
+await flush();
+check("a tab creation is under way (held by Chrome)", createCalls > 0);
+const off2 = popup({ type: "setEnabled", enabled: false });
+await flush();
+await advance(6000); // the 5 s drain gives up; both sweeps run with nothing to find yet
+await off2;
+check("the shutdown finished while the tab creation was still pending", tabCalls.removed.length === 0);
+releaseCreate();
+await flush();
+check("the tab that completes afterwards is closed, not left open while switched off", tabCalls.removed.includes(9), JSON.stringify(tabCalls.removed));
+
+// 10. The notice goes only to a route whose relay advertised it; a changed route forgets that.
+await popup({ type: "setEnabled", enabled: true });
+await advance(2000);
+const ninth = live().at(-1) ?? last();
+ninth.open();
+ninth.receive(binding);
+await flush();
+check("an accepted relay_binding with the advertisement stores the route it came from", typeof local.get("v8BrowserBridgeRelayNotice") === "string" && local.get("v8BrowserBridgeRelayNotice").includes("door.example"));
+local.set("v8BrowserBridgeRelayNotice", JSON.stringify(["https://elsewhere.example", "wss://elsewhere.example/ws", "x"]));
+const before10 = FakeWebSocket.instances.length;
+await popup({ type: "setEnabled", enabled: false });
+await advance(1500);
+const newNoticeSockets = FakeWebSocket.instances.slice(before10).filter(socket => new URL(socket.url).pathname === "/notice");
+check("support remembered for another route is not trusted: no notice connection, marker dropped", newNoticeSockets.length === 0 && local.get("v8BrowserBridgeOffNoticePending") === undefined);
+await popup({ type: "setEnabled", enabled: true });
+await advance(2000);
+const tenth = last();
+tenth.open();
+tenth.receive({ ...binding, switched_off_notice: undefined });
+await flush();
+check("a relay that stops advertising (an older one after a rollback) clears what was remembered", local.get("v8BrowserBridgeRelayNotice") === null);
 
 console.log = realLog;
 console.log(`\n${passed} passed, ${failed} failed`);

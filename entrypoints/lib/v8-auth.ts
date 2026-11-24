@@ -128,6 +128,10 @@ export function connectionKey(): string {
   return JSON.stringify([profile?.addressOrigin, profile?.relayBinding, profile?.browserId]);
 }
 
+/** The route a profile points at (address, socket endpoint, relay binding): what "this relay" means for remembered capabilities. */
+export function routeIdentity(): string | null {
+  return profile ? JSON.stringify([profile.addressOrigin, profile.wsEndpoint, profile.relayBinding]) : null;
+}
 export function hasProfile(): boolean { return profile !== null; }
 export function isEnabled(): boolean { return enabled && profile !== null; }
 /** True when the access token is expired or about to be: refresh before opening a socket with it. */

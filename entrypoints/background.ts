@@ -17,7 +17,7 @@ import { dispatch, toolNames } from "./lib/registry";
 import { installDetachListener, onDetach, setExecutionEnabled } from "./lib/cdp";
 import { closeAllPipes, closePipe, handlePipeCommand, installPipe, openPipe, pipeChannelCount } from "./lib/pipe";
 import { abortAllFetches } from "./lib/tools/fetch";
-import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, pendingAdoptions, setShuttingDown, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
+import { clearTargetTabIfMatches, focusPopupTarget, installNewTabAdopter, pendingAdoptions, stopAiWork, resumeAiWork, installSeenWatch, LAST_WORKSPACE_KEY, listAiTabs, migrateFromTabGroups, ownerOf, removeAiTabs, popupTarget, setAiTabGroupingEnabled, setLastWorkspace } from "./lib/target";
 import * as auth from "./lib/v8-auth";
 import type { ConnectionIssue } from "./lib/v8-auth";
 import { badgeFor, updateAvailable } from "./lib/badge";
@@ -54,7 +54,11 @@ let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 const HANDSHAKE_DEADLINE_MS = 15_000;
 /** The off-notice the relay has not received yet (the person switched off while no socket was bound). */
 const OFF_NOTICE_KEY = "v8BrowserBridgeOffNoticePending";
-/** Set once a relay said (in `relay_binding`) that it understands the notice-only connection. */
+/**
+ * The route (auth.routeIdentity) whose relay said, in an accepted `relay_binding`, that it understands the
+ * notice-only path. Only that route is trusted with it: a different profile or address, or a relay that
+ * never said so, gets no notice (an older relay would not know the path and an older door would drop it).
+ */
 const NOTICE_SUPPORTED_KEY = "v8BrowserBridgeRelayNotice";
 /** Work in flight that may create tabs (pipe open/command, tool calls); switching off waits for it before it counts tabs. */
 const inflightWork = new Set<Promise<unknown>>();
@@ -269,13 +273,14 @@ function handleMessage(msg: BridgeMessage, from: WebSocket, expectation: auth.Co
   switch (msg.type) {
     case "relay_binding":
       setAiTabGroupingEnabled(msg.tab_group === true);
-      if (msg.switched_off_notice === true) void chrome.storage.local.set({ [NOTICE_SUPPORTED_KEY]: true });
       if (!expectation) break;
       void auth.onRelayBinding(msg.relay_binding, expectation, () => socket === from).then(accepted => {
         // The answer is for the socket that asked; if it was replaced meanwhile, it is dropped.
         if (!accepted || socket !== from) return;
         bound = true;
         clearHandshakeTimer();
+        // Advertised support belongs to this route; advertising nothing forgets what an earlier relay on it said.
+        void chrome.storage.local.set({ [NOTICE_SUPPORTED_KEY]: msg.switched_off_notice === true ? auth.routeIdentity() : null });
         latestExtensionVersion = isExtensionVersion(msg.latest_extension_version) ? msg.latest_extension_version : null;
         // A rename made during the handshake (or before this socket opened with it) goes out now.
         const name = auth.snapshot().deviceName;
@@ -421,8 +426,8 @@ function pushSnapshot(): void {
  * Tabs counted before the work stopped would miss one the in-flight work was still opening.
  */
 async function stopWorkAndCloseAiTabs(stop: () => Promise<void>): Promise<void> {
-  setShuttingDown(true); // a child tab adopted from now on is closed, not kept
-  try {
+  stopAiWork(); // every tab operation that completes from now on, however late, is closed, not kept
+  {
     await stop();
     abortAllFetches(); // a stalled response body must not hold the shutdown
     await setExecutionEnabled(false);
@@ -435,8 +440,6 @@ async function stopWorkAndCloseAiTabs(stop: () => Promise<void>): Promise<void> 
       if (!tabIds.length) break;
       await removeAiTabs(tabIds).catch(error => log("closing AI tabs failed", String(error)));
     }
-  } finally {
-    setShuttingDown(false);
   }
   pushSnapshot();
 }
@@ -462,7 +465,7 @@ async function setEnabledByPerson(on: boolean): Promise<void> {
 }
 
 /**
- * Tell the relay the person switched off, over the notice-only connection (`/ws?notice=1`). It is not the
+ * Tell the relay the person switched off, over the notice-only connection (`/notice`). It is not the
  * bridge socket: the relay does not register it as a browser, never sends it work, activates no login and
  * replaces no socket; the worker adds no handler for tool or pipe frames on it. The relay records the
  * notice durably and answers `switched_off_ack`; only that answer clears the stored notice. A relay that
@@ -474,15 +477,17 @@ async function deliverOffNotice(): Promise<void> {
   if (noticeInFlight) return;
   const stored = await chrome.storage.local.get([OFF_NOTICE_KEY, NOTICE_SUPPORTED_KEY]);
   if (stored[OFF_NOTICE_KEY] !== true) return;
-  if (auth.snapshot().enabled || !auth.hasProfile() || stored[NOTICE_SUPPORTED_KEY] !== true) { await chrome.storage.local.remove(OFF_NOTICE_KEY); return; }
+  if (auth.snapshot().enabled || !auth.hasProfile() || stored[NOTICE_SUPPORTED_KEY] !== auth.routeIdentity()) { await chrome.storage.local.remove(OFF_NOTICE_KEY); return; }
   noticeInFlight = true;
   try {
     if (auth.accessTokenStale() && (!(await auth.refreshAccessToken()) || auth.accessTokenStale())) return;
     const base = auth.wsUrl();
     const subprotocol = auth.bearerSubprotocol();
     if (!base || (auth.requiresBearer() && !subprotocol)) return;
+    // The dedicated path: a relay or door without it refuses the upgrade rather than registering a browser.
     const url = new URL(base);
-    url.searchParams.set("notice", "1");
+    if (!/\/ws$/.test(url.pathname)) { await chrome.storage.local.remove(OFF_NOTICE_KEY); return; }
+    url.pathname = url.pathname.replace(/\/ws$/, "/notice");
     const acknowledged = await new Promise<boolean>(resolve => {
       let notice: WebSocket;
       try { notice = auth.requiresBearer() ? new WebSocket(url.toString(), [subprotocol as string]) : new WebSocket(url.toString()); }
@@ -605,7 +610,9 @@ export default defineBackground(() => {
       // Before the relay bound this socket the new name waits: it is sent right after binding (handleMessage).
       announceName: name => { if (bound) { send({ type: "extension_rename", name }); socketName = name; } },
       onChange: snap => {
-        void setExecutionEnabled(snap.state === "connected" || snap.state === "connecting");
+        const on = snap.state === "connected" || snap.state === "connecting";
+        if (on) resumeAiWork();
+        void setExecutionEnabled(on);
         pushSnapshot();
       },
     }).then(() => deliverOffNotice());
